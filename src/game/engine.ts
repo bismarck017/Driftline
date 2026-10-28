@@ -25,6 +25,11 @@ export interface HudStats {
   onRoad: boolean;
   clock: string; // "14:23"
   tod: number; // time of day in hours [0, 24)
+  // drivetrain / gauge cluster
+  gear: number; // -1 = R, 0 = N, 1..N = forward gear
+  revs: number; // 0..1 (0 = idle, 1 = redline)
+  distance: number; // metres travelled
+  locked: boolean; // wheels locked & skidding under heavy braking
 }
 
 export interface EngineOptions {
@@ -191,6 +196,16 @@ export class DriveGame {
   private hudTimer = 0;
   private stuckTimer = 0; // bogged-in-water watchdog
 
+  // drivetrain & tire state
+  private gear = 1;
+  private gearTop: number[] = []; // shift points (m/s) per forward gear
+  private revs = 0;
+  private odometer = 0; // metres travelled
+  private lockProg = 0; // brake-lockup accumulation 0..1
+  private locked = false;
+  private throttleIn = false;
+  private revBlend = 0; // 0 = chase cam behind, 1 = reverse cam ahead
+
   // day-night state
   private todHours = 10; // in-world hour [0, 24)
   private cycleEnabled = true;
@@ -328,6 +343,10 @@ export class DriveGame {
     // ── the player's car ──
     this.built = buildCar(car);
     this.scene.add(this.built.group);
+
+    // gearbox: shift points as widening fractions of the road top speed
+    const pattern = car.id === "sport" ? [0.24, 0.4, 0.55, 0.7, 0.86, 1.02] : [0.3, 0.48, 0.66, 0.84, 1.02];
+    this.gearTop = pattern.map((f) => f * car.stats.topSpeed);
 
     // headlight beam (auto-on at night) + boosted emissive lamps
     this.headlights = new THREE.SpotLight(0xffe3ae, 0, 85, 0.62, 0.55, 1);
@@ -550,16 +569,40 @@ export class DriveGame {
     // heavy viscous drag in water — rivers can be forded slowly, lakes will bog you down
     if (inWater) this.speed -= this.speed * 2.4 * dt;
 
+    // ── gearbox: auto shift up through the speed ranges, back down on lift ──
+    const roadTop = s.topSpeed;
+    const hi = this.gearTop[this.gear - 1];
+    const lo = this.gear > 1 ? this.gearTop[this.gear - 2] * 0.92 : 0;
+    if (this.speed > hi && this.gear < this.gearTop.length) this.gear++;
+    else if (this.speed < lo && this.gear > 1) this.gear--;
+
+    // revs within the current gear, with a little launch flare and a
+    // scaled "reverse gear" band when backing up
+    let revNorm = clamp((this.speed - lo) / Math.max(hi - lo, 1), 0, 1);
+    if (throttle && this.speed < 1.5) revNorm = Math.max(revNorm, 0.5);
+    if (this.speed < -0.3) revNorm = clamp(Math.abs(this.speed) / (roadTop * 0.25), 0, 1) * 0.85;
+    this.revs = lerp(this.revs, revNorm, 1 - Math.exp(-8 * dt));
+
     // longitudinal
-    const topSpeed = s.topSpeed * (onRoad ? 1 : lerp(s.offroad, 1, 0.25));
+    const topSpeed = roadTop * (onRoad ? 1 : lerp(s.offroad, 1, 0.25));
     if (throttle) {
       const powerCurve = 1 - Math.max(this.speed, 0) / (topSpeed * 1.35);
-      this.speed += s.accel * Math.max(powerCurve, 0) * surfaceFactor * dt;
+      const torque = lerp(0.62, 1, revNorm); // short gears pull harder
+      this.speed += s.accel * Math.max(powerCurve, 0) * torque * surfaceFactor * dt;
     }
-    if (brake) {
-      if (this.speed > 0.5) this.speed -= 26 * dt;
-      else this.speed -= s.accel * 0.45 * surfaceFactor * dt; // reverse
+    if (brake && this.speed > 0.5) {
+      // heavy braking — the fronts can lock and the car skids. At speed the
+      // pedal overpowers the tires almost immediately (real stomp = lock);
+      // parking-speed stops stay controlled because lock builds slowly there.
+      const lockGain = (this.speed > 9 ? 3.4 : 0.9) * (onRoad ? 1 : 1.5);
+      this.lockProg = clamp(this.lockProg + lockGain * dt, 0, 1);
+      this.speed -= (this.lockProg >= 1 ? 13.5 : 26) * dt;
+    } else if (brake) {
+      this.speed -= s.accel * 0.45 * surfaceFactor * dt; // reverse
+    } else {
+      this.lockProg = Math.max(0, this.lockProg - 3 * dt);
     }
+    this.locked = this.lockProg >= 1 && this.speed > 4;
     if (handbrake) this.speed -= Math.sign(this.speed) * 14 * dt;
 
     // drag & rolling resistance
@@ -581,16 +624,30 @@ export class DriveGame {
     if (slope > 0.5 && this.speed > 0) this.speed -= (slope - 0.5) * 120 * dt;
     if (slope < -0.5 && this.speed < 0) this.speed -= (slope + 0.5) * 120 * dt;
 
-    // steering
+    // steering — the yaw the tires can actually deliver is capped by grip,
+    // so inertia limits how fast the car changes direction at speed
     const speedRatio = clamp(Math.abs(this.speed) / 10, 0, 1);
     const steerRate = 1.9 * s.grip * (handbrake ? 1.7 : 1);
-    const effectiveSteer = steerIn * steerRate * speedRatio * (this.speed < 0 ? -1 : 1) * dt;
-    this.heading += effectiveSteer;
+    const desired = steerIn * steerRate * speedRatio * (this.speed < 0 ? -1 : 1);
+    const latMax = 12.5 * s.grip * (this.locked ? 0.34 : 1) * (handbrake ? 1.55 : 1);
+    const yawMax = latMax / Math.max(Math.abs(this.speed), 2.5);
+    this.heading += clamp(desired, -yawMax, yawMax) * dt;
+    // locked wheels keep their momentum — the nose keeps drifting with committed
+    // steering input, so you counter-steer through the slide
+    if (this.locked) this.heading += this.steerAngle * 0.4 * clamp(this.speed / 30, 0, 1) * dt;
     this.steerAngle = lerp(this.steerAngle, steerIn * 0.42, 1 - Math.exp(-10 * dt));
+
+    // torque steer: a hard launch tugs the nose to one side until speed builds
+    if (throttle && this.speed > -0.1) {
+      const decay = 1 - clamp(this.speed / 9, 0, 1);
+      this.heading -= (0.05 + s.accel * 0.004) * decay * decay * dt;
+    }
 
     // integrate position
     this.pos.x += dirX * this.speed * dt;
     this.pos.z += dirZ * this.speed * dt;
+    this.odometer += Math.abs(this.speed) * dt;
+    this.throttleIn = !!throttle;
 
     // fell into deep water? respawn (river beds carve to ~-1.9, so anything
     // below -1.35 is undriveable — never leave the car floating there)
@@ -665,15 +722,20 @@ export class DriveGame {
     const dist = (far ? 16 : 8.2) + sp * (far ? 0.16 : 0.09);
     const height = far ? 9.5 : 3.1 + sp * 0.012;
 
-    const camX = this.pos.x - dirX * dist;
-    const camZ = this.pos.z - dirZ * dist;
+    // reversing? the camera swings around to the front and looks down the
+    // car's path of travel, so you can see where you're backing into
+    this.revBlend = lerp(this.revBlend, this.speed < -0.6 ? 1 : 0, 1 - Math.exp(-3.2 * dt));
+    const side = dist * (2 * this.revBlend - 1); // -dist behind .. +dist ahead
+    const camX = this.pos.x + dirX * side;
+    const camZ = this.pos.z + dirZ * side;
     const groundClear = surfaceHeightAt(camX, camZ) + 1.6;
     const camY = Math.max(this.pos.y + height, groundClear);
 
     _camPos.set(camX, camY, camZ);
     this.camera.position.lerp(_camPos, 1 - Math.exp(-(far ? 3 : 6) * dt));
 
-    _look.set(this.pos.x + dirX * 7, this.pos.y + 1.6, this.pos.z + dirZ * 7);
+    const lookSide = 7 * (1 - 2 * this.revBlend); // ahead .. behind
+    _look.set(this.pos.x + dirX * lookSide, this.pos.y + 1.6, this.pos.z + dirZ * lookSide);
     this.camera.lookAt(_look);
 
     const fov = 56 + clamp(sp / 60, 0, 1) * 10;
@@ -716,9 +778,9 @@ export class DriveGame {
     this.updateCamera(dt);
     this.renderer.render(this.scene, this.camera);
 
-    // HUD ~8x per second
+    // HUD ~16x per second (keeps the rev bar lively)
     this.hudTimer += dt;
-    if (this.hudTimer > 0.12 && this.onHud) {
+    if (this.hudTimer > 0.06 && this.onHud) {
       this.hudTimer = 0;
       const h = surfaceHeightAt(this.pos.x, this.pos.z);
       const tt = h < 0.35 && !isOnRoad(this.pos.x, this.pos.z) ? "ocean" : terrainTypeAt(this.pos.x, this.pos.z, Math.max(h, 0));
@@ -740,6 +802,10 @@ export class DriveGame {
         onRoad: isOnRoad(this.pos.x, this.pos.z),
         clock,
         tod: this.todHours,
+        gear: this.speed < -0.3 ? -1 : Math.abs(this.speed) < 0.3 && !this.throttleIn ? 0 : this.gear,
+        revs: this.revs,
+        distance: this.odometer,
+        locked: this.locked,
       });
     }
   };

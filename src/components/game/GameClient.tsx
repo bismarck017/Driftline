@@ -346,7 +346,7 @@ export function GameClient() {
           <button
             onClick={toggleUnit}
             aria-label={`Speed in ${unit === "kmh" ? "kilometres per hour" : "miles per hour"}. Click to switch units.`}
-            className="absolute left-5 top-5 z-10 flex cursor-pointer select-none items-end gap-3 rounded-3xl bg-white/70 px-6 py-4 text-left shadow-xl shadow-stone-900/10 backdrop-blur-md transition-all hover:bg-white/85 active:scale-[0.97]"
+            className="absolute bottom-6 left-1/2 z-10 flex -translate-x-1/2 cursor-pointer select-none items-end gap-3 rounded-3xl bg-white/70 px-6 py-4 text-left shadow-xl shadow-stone-900/10 backdrop-blur-md transition-all hover:bg-white/85 active:scale-[0.97]"
           >
             <span className="text-5xl font-bold tabular-nums leading-none text-stone-800">
               {unit === "kmh" ? stats.kmh : Math.round(stats.kmh * 0.621371)}
@@ -359,18 +359,44 @@ export function GameClient() {
             </span>
           </button>
 
-          {/* biome + position + world clock */}
+          {/* gauge cluster — gear, revs, clock, odometer */}
           <div className="pointer-events-none absolute bottom-5 left-5 z-10 rounded-2xl bg-white/70 px-5 py-3 shadow-lg shadow-stone-900/10 backdrop-blur-md">
-            <p className="flex items-center gap-2 text-sm font-semibold text-stone-700">
-              {stats.biome}
-              <span className="rounded-lg bg-stone-800/10 px-2 py-0.5 text-xs font-semibold tabular-nums text-stone-600">
-                {stats.clock}
-              </span>
-            </p>
-            <p className="text-[11px] tabular-nums text-stone-400">
-              {`${stats.x.toFixed(0)}, ${stats.z.toFixed(0)}`} · {stats.tilesLoaded} tiles streamed ·
-              on road: {stats.onRoad ? "yes" : "no"}
-            </p>
+            <div className="flex items-center gap-4">
+              <div className="flex w-9 flex-col items-center rounded-xl bg-stone-800/90 px-1.5 py-1.5">
+                <span className="text-xl font-bold leading-none tabular-nums text-[#f6efe2]">
+                  {stats.gear === -1 ? "R" : stats.gear === 0 ? "N" : stats.gear}
+                </span>
+                <span className="text-[8px] font-semibold uppercase tracking-widest text-[#f6efe2]/60">gear</span>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <div className="relative h-2.5 w-40 overflow-hidden rounded-full bg-stone-900/10">
+                  <div
+                    className="h-full rounded-full"
+                    style={{
+                      width: `${Math.round(stats.revs * 100)}%`,
+                      backgroundColor: stats.revs > 0.85 ? "#e26d6d" : "#57534e",
+                    }}
+                  />
+                  <span className="absolute left-[85%] top-0 h-full w-px bg-stone-800/40" />
+                </div>
+                <div className="flex w-40 items-center justify-between text-[10px] font-semibold tabular-nums text-stone-500">
+                  <span>{stats.clock}</span>
+                  <span>
+                    {stats.distance >= 1000
+                      ? `${(stats.distance / 1000).toFixed(1)} km`
+                      : `${Math.round(stats.distance)} m`}
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div className="mt-1.5 flex items-center gap-2 text-[11px]">
+              <span className="font-medium text-stone-500">{stats.biome}</span>
+              {stats.locked && (
+                <span className="rounded-md bg-[#e26d6d]/20 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-[#c2413d]">
+                  wheel lock
+                </span>
+              )}
+            </div>
           </div>
 
           {/* minimap */}
@@ -380,7 +406,7 @@ export function GameClient() {
 
           {/* controls hint */}
           <div
-            className={`pointer-events-none absolute bottom-5 right-5 z-10 rounded-2xl bg-white/70 px-5 py-3 text-[11px] text-stone-500 shadow-lg shadow-stone-900/10 backdrop-blur-md transition-opacity duration-1000 ${
+            className={`pointer-events-none absolute left-5 top-5 z-10 rounded-2xl bg-white/70 px-5 py-3 text-[11px] text-stone-500 shadow-lg shadow-stone-900/10 backdrop-blur-md transition-opacity duration-1000 ${
               showHints ? "opacity-100" : "opacity-0"
             }`}
           >
