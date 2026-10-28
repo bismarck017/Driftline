@@ -16,6 +16,12 @@ import { fbm1, fbm2, smoothstep, lerp, clamp, mulberry32 } from "./noise";
 export const TILE = 160; // world units per tile
 export const SEA_LEVEL = 0;
 
+// Terrain mesh discretisation — the SINGLE SOURCE OF TRUTH shared by the tile
+// builder (visuals) and every physics / placement query, so the ground the car
+// drives on is exactly the surface you see on screen.
+export const TERRAIN_SEGMENTS = 64; // terrain quads per tile edge
+export const TERRAIN_GRID = TILE / TERRAIN_SEGMENTS; // metres per quad (2.5)
+
 // ── Elevation ────────────────────────────────────────────────────────────────
 
 /** Macro terrain shape (continents / oceans), roughly [-1, 1] */
@@ -178,6 +184,38 @@ export function heightAt(x: number, z: number): number {
   return h;
 }
 
+/**
+ * Height of the RENDERED terrain surface at any world point.
+ *
+ * Tile meshes are PlaneGeometry grids (TERRAIN_SEGMENTS quads per tile edge)
+ * whose vertices sit exactly on heightAt() at the global TERRAIN_GRID lattice,
+ * and each quad is split along its anti-diagonal exactly like three.js does
+ * (triangles a-b-d and b-c-d -> the u+v = g diagonal). Sampling the same four
+ * lattice corners with the same two barycentric planes returns the height of
+ * the visible triangle surface itself — bit-identical at the nodes — so
+ * wheels, camera, road markings and props can never sink below or hover
+ * above the mesh, no matter how bumpy the detail noise is between vertices.
+ */
+export function surfaceHeightAt(x: number, z: number): number {
+  const g = TERRAIN_GRID;
+  const gx = Math.floor(x / g);
+  const gz = Math.floor(z / g);
+  const u = x - gx * g; // fraction across the quad, along +x
+  const v = z - gz * g; // fraction across the quad, along +z
+  const x0 = gx * g;
+  const z0 = gz * g;
+  const h00 = heightAt(x0, z0);
+  const h10 = heightAt(x0 + g, z0);
+  const h01 = heightAt(x0, z0 + g);
+  if (u + v <= g) {
+    // lower-left triangle: corners (0,0) (g,0) (0,g)
+    return h00 + ((h10 - h00) * u + (h01 - h00) * v) / g;
+  }
+  // upper-right triangle: corners (0,g) (g,g) (g,0)
+  const h11 = heightAt(x0 + g, z0 + g);
+  return h01 + ((u + v - g) / g) * (h11 - h01) + ((g - v) / g) * (h10 - h01);
+}
+
 // ── Biomes / terrain types ───────────────────────────────────────────────────
 
 export type TerrainType =
@@ -219,8 +257,11 @@ const C = {
   desert: [0.93, 0.83, 0.68] as RGB, // pastel sand / pinkish dune
   highlands: [0.76, 0.72, 0.68] as RGB, // warm grey rock
   snow: [0.95, 0.94, 0.94] as RGB, // off white
-  road: [0.52, 0.51, 0.5] as RGB, // soft asphalt
-  roadEdge: [0.78, 0.75, 0.71] as RGB, // gravel shoulder
+  // NOTE: vertex colours are LINEAR albedo values. Real asphalt is genuinely
+  // ~0.04-0.10 linear; with the scene's ~2.1x combined lighting, 0.055 reads
+  // as RGB ~95 dark grey on screen, contrasting strongly with the pastel terrain.
+  road: [0.055, 0.055, 0.065] as RGB, // dark grey asphalt
+  roadEdge: [0.82, 0.79, 0.73] as RGB, // pale gravel shoulder
 };
 
 /**
@@ -265,13 +306,14 @@ export function terrainColorAt(x: number, z: number, h: number, out: RGB): void 
   const rd = ri.dist;
   if (rd < ROAD_SHOULDER) {
     if (rd < ROAD_HALF) {
-      // asphalt core with worn wheel tracks
-      const t = smoothstep(ROAD_HALF - 1.0, ROAD_HALF, rd);
-      out[0] = lerp(out[0], C.road[0], 0.94);
-      out[1] = lerp(out[1], C.road[1], 0.94);
-      out[2] = lerp(out[2], C.road[2], 0.94);
+      // dark asphalt core — near-opaque so the edge reads crisply
+      const t = smoothstep(ROAD_HALF - 0.6, ROAD_HALF, rd);
+      out[0] = lerp(out[0], C.road[0], 0.97);
+      out[1] = lerp(out[1], C.road[1], 0.97);
+      out[2] = lerp(out[2], C.road[2], 0.97);
       if (Math.abs(rd - ROAD_HALF * 0.4) < ROAD_HALF * 0.16) {
-        const wear = 0.9 + 0.06 * t;
+        // polished wheel tracks: a faint lighter sheen on dark asphalt
+        const wear = 1.07 - 0.03 * t;
         out[0] *= wear;
         out[1] *= wear;
         out[2] *= wear;
@@ -305,45 +347,88 @@ export interface PropSpot {
   y: number;
   scale: number;
   rot: number;
-  kind: number; // 0 round tree, 1 pine, 2 bush, 3 rock, 4 cactus, 5 snowy tree
+  kind: number; // 0 round tree, 1 pine, 2 bush, 3 rock, 4 cactus, 5 snowy tree,
+  //            6 wildflower, 7 tall pine
 }
 
 /**
- * Deterministic prop placement for one tile. Density follows biome; roads,
- * rivers and water are kept clear; slopes are avoided for trees.
+ * Deterministic prop placement for one tile.
+ *
+ * Biodiversity rules:
+ *  · a large-scale "grove" noise field clusters trees into natural woodland
+ *    patches, while low-field areas stay open (clearings / open meadows);
+ *  · dense old-growth cores (high cluster value) grow tall pines;
+ *  · meadows mix scattered groves, wildflowers and bushes;
+ *  · roads keep a wide clear margin so no canopy or cactus ever touches the
+ *    asphalt; rivers and water are kept clear too;
+ *  · every prop sits on the RENDERED surface (surfaceHeightAt) so nothing
+ *    hovers above or sinks below the visible mesh;
+ *  · steep slopes reject plants (rocks don't mind them).
  */
 export function propsForTile(ti: number, tj: number): PropSpot[] {
   const rng = mulberry32((Math.imul(ti, 73856093) ^ Math.imul(tj, 19349663)) >>> 0);
   const spots: PropSpot[] = [];
-  const attempts = 90;
+  const attempts = 210;
   for (let i = 0; i < attempts; i++) {
     const x = (ti + rng()) * TILE;
     const z = (tj + rng()) * TILE;
     const h = heightAt(x, z);
     if (h < 0.9) continue;
-    if (roadDistance(x, z) < ROAD_SHOULDER + 3) continue;
+    // wide margin around roads: no vegetation on or over the asphalt
+    if (roadDistance(x, z) < ROAD_SHOULDER + 4) continue;
     if (riverDistance(x, z) < RIVER_HALF * 3.1 + 4) continue;
 
     const tt = terrainTypeAt(x, z, h);
+    // grove / glade mask — drives clustering AND clearings
+    const cluster = fbm2(x * 0.0042, z * 0.0042, 2, 4242);
     let kind = -1;
-    if (tt === "forest" && rng() < 0.92) kind = rng() < 0.45 ? 1 : 0;
-    else if (tt === "meadow" && rng() < 0.4) kind = rng() < 0.3 ? 1 : rng() < 0.55 ? 0 : 2;
-    else if (tt === "beach" && rng() < 0.05) kind = 3;
-    else if (tt === "desert" && rng() < 0.5) kind = rng() < 0.45 ? 4 : 3;
-    else if (tt === "highlands" && rng() < 0.55) kind = rng() < 0.7 ? 3 : 1;
-    else if (tt === "snow" && rng() < 0.4) kind = 5;
+    if (tt === "forest") {
+      // dense woodland in high-cluster zones, natural glades in low ones
+      const dense = cluster > 0.34 ? 0.95 : 0.3;
+      if (rng() < dense) {
+        const r = rng();
+        // old-growth cores favor tall pines, elsewhere pine/round mix
+        kind = cluster > 0.58 && r < 0.4 ? 7 : r < 0.55 ? 1 : 0;
+      } else if (rng() < 0.35) {
+        kind = 2; // bushes fill the glades
+      }
+    } else if (tt === "meadow") {
+      const grove = smoothstep(0.5, 0.72, cluster);
+      const r = rng();
+      const treeP = 0.06 + 0.5 * grove; // open meadows stay open
+      if (r < treeP) kind = rng() < 0.35 ? 1 : rng() < 0.6 ? 0 : 7;
+      else if (r < treeP + 0.26) kind = 6; // wildflower carpets
+      else if (r < treeP + 0.36) kind = 2;
+    } else if (tt === "beach") {
+      if (rng() < 0.06) kind = 3;
+      else if (rng() < 0.04) kind = 2;
+    } else if (tt === "desert") {
+      const patch = smoothstep(0.42, 0.7, cluster);
+      const r = rng();
+      if (r < 0.12 + 0.55 * patch) kind = 4; // cactus in patches
+      else if (r < 0.26 + 0.55 * patch) kind = 3;
+    } else if (tt === "highlands") {
+      const r = rng();
+      if (r < 0.4) kind = 3;
+      else if (r < 0.4 + (cluster > 0.52 ? 0.3 : 0.06)) kind = 1;
+    } else if (tt === "snow") {
+      const p = cluster > 0.55 ? 0.5 : 0.12;
+      if (rng() < p) kind = 5;
+    }
     if (kind < 0) continue;
 
     // avoid steep slopes for plants (rocks are fine)
     if (kind !== 3) {
       const dh = Math.abs(heightAt(x + 2, z) - heightAt(x - 2, z)) + Math.abs(heightAt(x, z + 2) - heightAt(x, z - 2));
-      if (dh > 2.6) continue;
+      const limit = kind === 6 ? 3.4 : 2.6;
+      if (dh > limit) continue;
     }
     spots.push({
       x,
       z,
-      y: h,
-      scale: 0.75 + rng() * 0.6,
+      // sit on the RENDERED surface, never the analytic one (anti float/sink)
+      y: surfaceHeightAt(x, z),
+      scale: kind === 6 ? 0.8 + rng() * 0.7 : 0.75 + rng() * 0.6,
       rot: rng() * Math.PI * 2,
       kind,
     });

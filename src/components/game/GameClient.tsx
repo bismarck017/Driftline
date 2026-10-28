@@ -9,6 +9,41 @@ import { Button } from "@/components/ui/button";
 
 type View = "garage" | "drive";
 
+interface DayNightPrefs {
+  cycle: boolean;
+  dayLength: number; // real seconds per in-world day
+  time: number; // locked hour [0, 24)
+}
+
+const DEFAULT_DN: DayNightPrefs = { cycle: true, dayLength: 240, time: 10 };
+
+function loadDayNightPrefs(): DayNightPrefs {
+  try {
+    const raw = window.localStorage.getItem("driftline-daynight");
+    if (raw) {
+      const p = JSON.parse(raw) as Partial<DayNightPrefs>;
+      return {
+        cycle: typeof p.cycle === "boolean" ? p.cycle : DEFAULT_DN.cycle,
+        dayLength: typeof p.dayLength === "number" ? p.dayLength : DEFAULT_DN.dayLength,
+        time: typeof p.time === "number" ? p.time : DEFAULT_DN.time,
+      };
+    }
+  } catch {
+    // private mode — defaults are fine
+  }
+  return DEFAULT_DN;
+}
+
+function formatClock(hours: number): string {
+  const h = Math.floor(((hours % 24) + 24) % 24);
+  const m = Math.floor((hours - Math.floor(hours)) * 60);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function formatDayLength(sec: number): string {
+  return sec < 120 ? `${sec}s` : sec % 60 === 0 ? `${sec / 60}min` : `${(sec / 60).toFixed(1)}min`;
+}
+
 function StatBar({ label, value, color }: { label: string; value: number; color: string }) {
   return (
     <div className="flex items-center gap-3">
@@ -47,17 +82,31 @@ export function GameClient() {
     }
     return "kmh";
   });
+  const [dn, setDn] = useState<DayNightPrefs>(() =>
+    typeof window === "undefined" ? DEFAULT_DN : loadDayNightPrefs(),
+  );
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<DriveGame | null>(null);
   const carRef = useRef<CarSpec>(CARS[0]);
   const settingsRef = useRef({ radius, shadows });
+  const dnRef = useRef(dn);
+
+  // persist day-night prefs (best-effort)
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("driftline-daynight", JSON.stringify(dn));
+    } catch {
+      // private mode — persistence is best-effort only
+    }
+  }, [dn]);
 
   // keep refs in sync outside of render (they are read when the engine boots)
   useEffect(() => {
     carRef.current = CARS[carIndex];
     settingsRef.current = { radius, shadows };
-  }, [carIndex, radius, shadows]);
+    dnRef.current = dn;
+  }, [carIndex, radius, shadows, dn]);
 
   const selectedCar = CARS[carIndex];
 
@@ -75,6 +124,9 @@ export function GameClient() {
           renderRadius: r,
           shadows: sh,
           onHud: (s) => setStats(s),
+          timeOfDay: dnRef.current.time,
+          cycleEnabled: dnRef.current.cycle,
+          dayLength: dnRef.current.dayLength,
         });
         engineRef.current = engine;
         engine.start();
@@ -128,6 +180,24 @@ export function GameClient() {
       }
       return next;
     });
+  };
+
+  // ── day-night controls ──────────────────────────────────────────────────
+  const toggleCycle = () => {
+    const cycle = !dn.cycle;
+    setDn((d) => ({ ...d, cycle, time: cycle ? d.time : stats?.tod ?? d.time }));
+    if (cycle) engineRef.current?.setCycle(true, dn.dayLength);
+    else engineRef.current?.setCycle(false); // freezes at the current world time
+  };
+
+  const changeDayLength = (v: number) => {
+    setDn((d) => ({ ...d, dayLength: v }));
+    if (dn.cycle) engineRef.current?.setCycle(true, v);
+  };
+
+  const changeLockedTime = (v: number) => {
+    setDn((d) => ({ ...d, cycle: false, time: v }));
+    engineRef.current?.lockTimeOfDay(v);
   };
 
   const backToGarage = () => {
@@ -296,9 +366,14 @@ export function GameClient() {
             </span>
           </button>
 
-          {/* biome + position */}
+          {/* biome + position + world clock */}
           <div className="pointer-events-none absolute bottom-5 left-5 z-10 rounded-2xl bg-white/70 px-5 py-3 shadow-lg shadow-stone-900/10 backdrop-blur-md">
-            <p className="text-sm font-semibold text-stone-700">{stats.biome}</p>
+            <p className="flex items-center gap-2 text-sm font-semibold text-stone-700">
+              {stats.biome}
+              <span className="rounded-lg bg-stone-800/10 px-2 py-0.5 text-xs font-semibold tabular-nums text-stone-600">
+                {stats.clock}
+              </span>
+            </p>
             <p className="text-[11px] tabular-nums text-stone-400">
               {`${stats.x.toFixed(0)}, ${stats.z.toFixed(0)}`} · {stats.tilesLoaded} tiles streamed ·
               on road: {stats.onRoad ? "yes" : "no"}
@@ -374,6 +449,60 @@ export function GameClient() {
                 >
                   {shadows ? "On" : "Off"}
                 </button>
+              </div>
+
+              {/* day-night cycle controls */}
+              <div className="flex flex-col gap-3 border-t border-stone-300/60 pt-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium text-stone-600">Day-night cycle</span>
+                  <button
+                    onClick={toggleCycle}
+                    className={`rounded-xl px-4 py-1.5 text-xs font-semibold transition-colors ${
+                      dn.cycle ? "bg-stone-800 text-[#f6efe2]" : "bg-stone-900/10 text-stone-500"
+                    }`}
+                  >
+                    {dn.cycle ? "Cycling" : "Locked"}
+                  </button>
+                </div>
+                {dn.cycle && (
+                  <label className="flex items-center justify-between gap-3">
+                    <span className="text-sm font-medium text-stone-600">Day length</span>
+                    <span className="flex flex-1 items-center gap-3">
+                      <input
+                        type="range"
+                        min={60}
+                        max={600}
+                        step={30}
+                        value={dn.dayLength}
+                        onChange={(e) => changeDayLength(Number(e.target.value))}
+                        className="h-1.5 flex-1 cursor-pointer accent-stone-800"
+                      />
+                      <span className="w-12 text-right text-xs font-semibold tabular-nums text-stone-500">
+                        {formatDayLength(dn.dayLength)}
+                      </span>
+                    </span>
+                  </label>
+                )}
+                <label className="flex items-center justify-between gap-3">
+                  <span className="text-sm font-medium text-stone-600">Time of day</span>
+                  <span className="flex flex-1 items-center gap-3">
+                    <input
+                      type="range"
+                      min={0}
+                      max={24}
+                      step={0.25}
+                      value={dn.cycle ? (stats?.tod ?? dn.time) : dn.time}
+                      onChange={(e) => changeLockedTime(Number(e.target.value))}
+                      className="h-1.5 flex-1 cursor-pointer accent-stone-800"
+                    />
+                    <span className="w-12 text-right text-xs font-semibold tabular-nums text-stone-500">
+                      {dn.cycle ? (stats ? formatClock(stats.tod) : "--:--") : formatClock(dn.time)}
+                    </span>
+                  </span>
+                </label>
+                <p className="text-[11px] leading-snug text-stone-400">
+                  Drag the clock to lock the world at a fixed hour; switch to Cycling to let it run.
+                </p>
               </div>
             </div>
 

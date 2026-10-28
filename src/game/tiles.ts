@@ -10,6 +10,7 @@ import {
   TILE,
   SEA_LEVEL,
   heightAt,
+  surfaceHeightAt,
   terrainColorAt,
   propsForTile,
   roadInfo,
@@ -18,27 +19,34 @@ import {
   ROAD_SPACING,
   ROAD_WARP,
   ROAD_HALF,
+  TERRAIN_SEGMENTS,
+  TERRAIN_GRID,
   type PropSpot,
 } from "./world";
-
-const SEGMENTS = 40; // terrain quads per tile edge
 
 // Shared, never-disposed prop assets ─────────────────────────────────────────
 interface PropAssets {
   trunkGeo: THREE.CylinderGeometry;
   roundGeo: THREE.IcosahedronGeometry;
   pineGeo: THREE.ConeGeometry;
+  tallPineGeo: THREE.ConeGeometry;
+  flowerGeo: THREE.IcosahedronGeometry;
   bushGeo: THREE.IcosahedronGeometry;
   rockGeo: THREE.IcosahedronGeometry;
   cactusGeo: THREE.CapsuleGeometry;
   trunkMat: THREE.MeshStandardMaterial;
   leafMat: THREE.MeshStandardMaterial;
   leafDarkMat: THREE.MeshStandardMaterial;
+  pineDeepMat: THREE.MeshStandardMaterial;
+  flowerMat: THREE.MeshStandardMaterial;
   bushMat: THREE.MeshStandardMaterial;
   rockMat: THREE.MeshStandardMaterial;
   cactusMat: THREE.MeshStandardMaterial;
   snowLeafMat: THREE.MeshStandardMaterial;
 }
+
+// Pastel wildflower palette — applied per-instance (deterministic per spot)
+const FLOWER_COLORS = [0xf2a7c3, 0xe2b4f0, 0xf7e6a0, 0xf5b8a0, 0xbcdcf2, 0xf0f0e6];
 
 let assets: PropAssets | null = null;
 
@@ -48,12 +56,16 @@ function getAssets(): PropAssets {
     trunkGeo: new THREE.CylinderGeometry(0.16, 0.22, 1.3, 6),
     roundGeo: new THREE.IcosahedronGeometry(1.15, 0),
     pineGeo: new THREE.ConeGeometry(0.95, 2.6, 7),
+    tallPineGeo: new THREE.ConeGeometry(0.66, 3.8, 7),
+    flowerGeo: new THREE.IcosahedronGeometry(0.17, 0),
     bushGeo: new THREE.IcosahedronGeometry(0.62, 0),
     rockGeo: new THREE.IcosahedronGeometry(0.85, 0),
     cactusGeo: new THREE.CapsuleGeometry(0.4, 1.4, 4, 8),
     trunkMat: new THREE.MeshStandardMaterial({ color: 0x9c7b63, roughness: 0.9, flatShading: true }),
     leafMat: new THREE.MeshStandardMaterial({ color: 0x8fce8f, roughness: 0.9, flatShading: true }),
     leafDarkMat: new THREE.MeshStandardMaterial({ color: 0x6ea86f, roughness: 0.9, flatShading: true }),
+    pineDeepMat: new THREE.MeshStandardMaterial({ color: 0x55936e, roughness: 0.9, flatShading: true }),
+    flowerMat: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85, flatShading: true }),
     bushMat: new THREE.MeshStandardMaterial({ color: 0xa9d6a5, roughness: 0.95, flatShading: true }),
     rockMat: new THREE.MeshStandardMaterial({ color: 0xbcb4a8, roughness: 0.95, flatShading: true }),
     cactusMat: new THREE.MeshStandardMaterial({ color: 0x9ec49a, roughness: 0.9, flatShading: true }),
@@ -81,9 +93,13 @@ export class TileManager {
 
   terrainMat: THREE.MeshStandardMaterial;
   markingMat: THREE.MeshStandardMaterial;
-  waterUniforms: { time: { value: number } };
+  waterUniforms: { time: { value: number }; tint: { value: THREE.Color } };
 
-  constructor(scene: THREE.Scene, radius: number, waterUniforms: { time: { value: number } }) {
+  constructor(
+    scene: THREE.Scene,
+    radius: number,
+    waterUniforms: { time: { value: number }; tint: { value: THREE.Color } },
+  ) {
     this.scene = scene;
     this.radius = radius;
     this.waterUniforms = waterUniforms;
@@ -94,8 +110,8 @@ export class TileManager {
       flatShading: true,
     });
     this.markingMat = new THREE.MeshStandardMaterial({
-      color: 0xf3eedd,
-      roughness: 0.85,
+      color: 0xf8f8f2, // bright white lane paint for contrast on dark asphalt
+      roughness: 0.8,
       polygonOffset: true,
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -2,
@@ -185,15 +201,23 @@ export class TileManager {
     const oz = tj * TILE;
 
     // ── terrain mesh ──
-    const geo = new THREE.PlaneGeometry(TILE, TILE, SEGMENTS, SEGMENTS);
+    // TERRAIN_SEGMENTS matches the lattice used by surfaceHeightAt(), so the
+    // rendered triangles ARE the physics ground (no sink / hover ever).
+    const geo = new THREE.PlaneGeometry(TILE, TILE, TERRAIN_SEGMENTS, TERRAIN_SEGMENTS);
     geo.rotateX(-Math.PI / 2); // y-up
     const pos = geo.attributes.position as THREE.BufferAttribute;
     const colors = new Float32Array(pos.count * 3);
     const rgb: [number, number, number] = [0, 0, 0];
     let minY = Infinity;
     for (let i = 0; i < pos.count; i++) {
-      const wx = ox + pos.getX(i);
-      const wz = oz + pos.getZ(i);
+      // The tile group is later placed at the tile CENTRE (ox + TILE/2), so a
+      // vertex at local (x,z) actually renders at world (ox + TILE/2 + x, ...).
+      // Sample the world model at the vertex's TRUE world position — this used
+      // to be off by half a tile, which shifted the whole visible terrain 80
+      // units away from the physics ground (the sink/hover bug) and displaced
+      // the painted asphalt from the real road centreline.
+      const wx = ox + TILE / 2 + pos.getX(i);
+      const wz = oz + TILE / 2 + pos.getZ(i);
       const h = heightAt(wx, wz);
       pos.setY(i, h);
       if (h < minY) minY = h;
@@ -217,8 +241,9 @@ export class TileManager {
       const wgeo = new THREE.PlaneGeometry(TILE, TILE, 8, 8);
       wgeo.rotateX(-Math.PI / 2);
       // fog uniforms (cloned per tile) + shared animated time uniform
-      const wUniforms = THREE.UniformsUtils.clone(THREE.UniformsLib.fog);
-      wUniforms.time = this.waterUniforms;
+      const wUniforms = THREE.UniformsUtils.clone(THREE.UniformsLib.fog) as Record<string, THREE.IUniform>;
+      wUniforms.time = this.waterUniforms.time;
+      wUniforms.tint = this.waterUniforms.tint; // day-night tint, shared with the engine
       const wmat = new THREE.ShaderMaterial({
         uniforms: wUniforms,
         transparent: true,
@@ -240,13 +265,14 @@ export class TileManager {
         fragmentShader: `
           #include <fog_pars_fragment>
           uniform float time;
+          uniform vec3 tint;
           varying vec3 vWpos;
           void main() {
             vec3 shallow = vec3(0.78, 0.90, 0.90);
             vec3 deep = vec3(0.55, 0.76, 0.79);
             vec3 viewDir = normalize(cameraPosition - vWpos);
             float fres = pow(1.0 - max(viewDir.y, 0.0), 1.6);
-            vec3 col = mix(shallow, deep, fres);
+            vec3 col = mix(shallow, deep, fres) * tint;
             gl_FragColor = vec4(col, 0.82);
             #include <fog_fragment>
           }
@@ -276,8 +302,12 @@ export class TileManager {
 
   /**
    * Road markings as real geometry (merged boxes, one mesh per tile):
-   *   · dashed cream centerlines following the curved road lattice
-   *   · solid lane-edge lines just inside the asphalt
+   *   · dashed bright centre lines following the curved road lattice
+   *   · solid lane-edge strips just inside the asphalt, segmented along the
+   *     terrain grid so every strip hugs the RENDERED surface
+   *   · each strip is TILTED to follow the surface slope between its two
+   *     endpoints (surfaceHeightAt), so markings never sink below or float
+   *     above the asphalt — they line up visually AND physically
    *   · omitted near intersections so crossings stay clean
    * Deterministic in world space, so markings continue seamlessly across tiles.
    */
@@ -291,16 +321,37 @@ export class TileManager {
     const dashW = 0.5;
     const dashL = 3.2;
     const dashStep = 14;
-    const edgeW = 0.3;
-    const edgeStep = 4;
-    const edgeL = edgeStep + 0.15; // slight overlap so the line is continuous
+    const edgeW = 0.32;
+    const edgeStep = TERRAIN_GRID; // grid-aligned -> strips follow the surface exactly
+    const edgeL = edgeStep * 1.04; // slight overlap so the line is continuous
     const edgeOff = ROAD_HALF - 1.15;
     const clear = ROAD_HALF + 2.5;
+    const markH = 0.08;
+    const lift = 0.05; // bottom of the paint sits ~1cm above the rendered asphalt
 
-    const push = (x: number, y: number, z: number, w: number, d: number, ry: number) => {
-      const g = new THREE.BoxGeometry(w, 0.05, d);
-      if (ry) g.rotateY(ry);
-      g.translate(x - cx, y, z - cz);
+    /** A paint strip between two world endpoints, tilted to match the rendered
+     *  surface at both ends, then yawed to the endpoint direction.
+     *  alongX=true -> the strip runs along x (east-west roads), else along z. */
+    const strip = (
+      x1: number, z1: number,
+      x2: number, z2: number,
+      w: number, d: number,
+      alongX: boolean,
+    ) => {
+      const h1 = surfaceHeightAt(x1, z1);
+      const h2 = surfaceHeightAt(x2, z2);
+      if (Math.min(h1, h2) < 0.9) return; // in water / below the beach line
+      const dx = x2 - x1;
+      const dz = z2 - z1;
+      const len = Math.hypot(dx, dz);
+      if (len < 1e-4) return;
+      const g = new THREE.BoxGeometry(w, markH, d);
+      const slope = Math.atan2(h2 - h1, len);
+      if (alongX) g.rotateZ(slope); // x-aligned strip pitches about z
+      else g.rotateX(-slope); // z-aligned strip pitches about x
+      // yaw the strip to its travel direction (rotateY: +x -> (cos,-sin), +z -> (sin,cos))
+      g.rotateY(alongX ? Math.atan2(-dz, dx) : Math.atan2(dx, dz));
+      g.translate((x1 + x2) / 2 - cx, (h1 + h2) / 2 + lift, (z1 + z2) / 2 - cz);
       geos.push(g);
     };
 
@@ -308,34 +359,32 @@ export class TileManager {
     const kMin = Math.floor((ox - ROAD_WARP) / ROAD_SPACING) - 1;
     const kMax = Math.ceil((ox + TILE + ROAD_WARP) / ROAD_SPACING) + 1;
     for (let k = kMin; k <= kMax; k++) {
-      // dashes
+      // dashed centre lines
       for (let m = Math.floor(oz / dashStep) - 1; m <= Math.ceil((oz + TILE) / dashStep) + 1; m++) {
-        const z = m * dashStep + dashStep / 2;
-        if (z < oz - 0.5 || z > oz + TILE + 0.5) continue;
-        const x = roadCenterNS(k, z);
-        if (x < ox - 0.5 || x > ox + TILE + 0.5) continue;
-        const ri = roadInfo(x, z);
-        if (ri.otherDist < clear) continue;
-        const h = heightAt(x, z);
-        if (h < 0.9) continue;
-        const x2 = roadCenterNS(k, z + 1);
-        push(x, h + 0.045, z, dashW, dashL, Math.atan2(x2 - x, 1));
+        const zc = m * dashStep + dashStep / 2;
+        if (zc < oz - 0.5 || zc > oz + TILE + 0.5) continue;
+        const xm = roadCenterNS(k, zc);
+        if (xm < ox - 0.5 || xm > ox + TILE + 0.5) continue;
+        if (roadInfo(xm, zc).otherDist < clear) continue;
+        strip(
+          roadCenterNS(k, zc - dashL / 2), zc - dashL / 2,
+          roadCenterNS(k, zc + dashL / 2), zc + dashL / 2,
+          dashW, dashL, false,
+        );
       }
-      // edge lines (segmented strips following the curve)
+      // solid lane-edge strips, segmented along the terrain grid
       for (let s = Math.floor(oz / edgeStep) - 1; s <= Math.ceil((oz + TILE) / edgeStep) + 1; s++) {
-        const z = s * edgeStep + edgeStep / 2;
-        if (z < oz - 0.5 || z > oz + TILE + 0.5) continue;
-        const xc = roadCenterNS(k, z);
-        const x2 = roadCenterNS(k, z + 1);
-        const ry = Math.atan2(x2 - xc, 1);
+        const zc = s * edgeStep + edgeStep / 2;
+        if (zc < oz - 0.5 || zc > oz + TILE + 0.5) continue;
         for (const side of [-1, 1]) {
-          const x = xc + side * edgeOff;
-          if (x < ox - 0.5 || x > ox + TILE + 0.5) continue;
-          const ri = roadInfo(x, z);
-          if (ri.otherDist < clear) continue;
-          const h = heightAt(x, z);
-          if (h < 0.9) continue;
-          push(x, h + 0.04, z, edgeW, edgeL, ry);
+          const xm = roadCenterNS(k, zc) + side * edgeOff;
+          if (xm < ox - 0.5 || xm > ox + TILE + 0.5) continue;
+          if (roadInfo(xm, zc).otherDist < clear) continue;
+          strip(
+            roadCenterNS(k, zc - edgeStep / 2) + side * edgeOff, zc - edgeStep / 2,
+            roadCenterNS(k, zc + edgeStep / 2) + side * edgeOff, zc + edgeStep / 2,
+            edgeW, edgeL, false,
+          );
         }
       }
     }
@@ -344,32 +393,32 @@ export class TileManager {
     const mMin = Math.floor((oz - ROAD_WARP) / ROAD_SPACING) - 1;
     const mMax = Math.ceil((oz + TILE + ROAD_WARP) / ROAD_SPACING) + 1;
     for (let m = mMin; m <= mMax; m++) {
+      // dashed centre lines
       for (let n = Math.floor(ox / dashStep) - 1; n <= Math.ceil((ox + TILE) / dashStep) + 1; n++) {
-        const x = n * dashStep + dashStep / 2;
-        if (x < ox - 0.5 || x > ox + TILE + 0.5) continue;
-        const z = roadCenterEW(m, x);
-        if (z < oz - 0.5 || z > oz + TILE + 0.5) continue;
-        const ri = roadInfo(x, z);
-        if (ri.otherDist < clear) continue;
-        const h = heightAt(x, z);
-        if (h < 0.9) continue;
-        const z2 = roadCenterEW(m, x + 1);
-        push(x, h + 0.045, z, dashL, dashW, Math.atan2(1, z2 - z));
+        const xc = n * dashStep + dashStep / 2;
+        if (xc < ox - 0.5 || xc > ox + TILE + 0.5) continue;
+        const zm = roadCenterEW(m, xc);
+        if (zm < oz - 0.5 || zm > oz + TILE + 0.5) continue;
+        if (roadInfo(xc, zm).otherDist < clear) continue;
+        strip(
+          xc - dashL / 2, roadCenterEW(m, xc - dashL / 2),
+          xc + dashL / 2, roadCenterEW(m, xc + dashL / 2),
+          dashL, dashW, true,
+        );
       }
+      // solid lane-edge strips, segmented along the terrain grid
       for (let s = Math.floor(ox / edgeStep) - 1; s <= Math.ceil((ox + TILE) / edgeStep) + 1; s++) {
-        const x = s * edgeStep + edgeStep / 2;
-        if (x < ox - 0.5 || x > ox + TILE + 0.5) continue;
-        const zc = roadCenterEW(m, x);
-        const z2 = roadCenterEW(m, x + 1);
-        const ry = Math.atan2(1, z2 - zc);
+        const xc = s * edgeStep + edgeStep / 2;
+        if (xc < ox - 0.5 || xc > ox + TILE + 0.5) continue;
         for (const side of [-1, 1]) {
-          const z = zc + side * edgeOff;
-          if (z < oz - 0.5 || z > oz + TILE + 0.5) continue;
-          const ri = roadInfo(x, z);
-          if (ri.otherDist < clear) continue;
-          const h = heightAt(x, z);
-          if (h < 0.9) continue;
-          push(x, h + 0.04, z, edgeL, edgeW, ry);
+          const zm = roadCenterEW(m, xc) + side * edgeOff;
+          if (zm < oz - 0.5 || zm > oz + TILE + 0.5) continue;
+          if (roadInfo(xc, zm).otherDist < clear) continue;
+          strip(
+            xc - edgeStep / 2, roadCenterEW(m, xc - edgeStep / 2) + side * edgeOff,
+            xc + edgeStep / 2, roadCenterEW(m, xc + edgeStep / 2) + side * edgeOff,
+            edgeL, edgeW, true,
+          );
         }
       }
     }
@@ -387,16 +436,18 @@ export class TileManager {
     if (spots.length === 0) return [];
     const A = getAssets();
     const kinds = [
-      { geo: A.trunkGeo, mat: A.trunkMat, offsetY: 0.55 },
-      { geo: A.roundGeo, mat: A.leafMat, offsetY: 1.75 },
-      { geo: A.pineGeo, mat: A.leafDarkMat, offsetY: 2.2 },
-      { geo: A.bushGeo, mat: A.bushMat, offsetY: 0.45 },
-      { geo: A.rockGeo, mat: A.rockMat, offsetY: 0.35 },
-      { geo: A.cactusGeo, mat: A.cactusMat, offsetY: 0.9 },
-      { geo: A.roundGeo, mat: A.snowLeafMat, offsetY: 1.75 },
+      { geo: A.trunkGeo, mat: A.trunkMat, offsetY: 0.55 },   // 0 trunk
+      { geo: A.roundGeo, mat: A.leafMat, offsetY: 1.75 },     // 1 round tree canopy
+      { geo: A.pineGeo, mat: A.leafDarkMat, offsetY: 2.2 },    // 2 pine
+      { geo: A.bushGeo, mat: A.bushMat, offsetY: 0.45 },       // 3 bush
+      { geo: A.rockGeo, mat: A.rockMat, offsetY: 0.35 },       // 4 rock
+      { geo: A.cactusGeo, mat: A.cactusMat, offsetY: 0.9 },    // 5 cactus
+      { geo: A.roundGeo, mat: A.snowLeafMat, offsetY: 1.75 },  // 6 snowy tree
+      { geo: A.tallPineGeo, mat: A.pineDeepMat, offsetY: 2.7 },// 7 tall pine
+      { geo: A.flowerGeo, mat: A.flowerMat, offsetY: 0.1 },     // 8 wildflower
     ];
     // kind mapping from PropSpot.kind -> asset index
-    const kindMap: Record<number, number> = { 0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6 };
+    const kindMap: Record<number, number> = { 0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 8, 7: 7 };
     const lists: { meshIdx: number; spots: PropSpot[] }[] = [];
     for (const s of spots) {
       let li = lists.find((l) => l.meshIdx === kindMap[s.kind]);
@@ -416,13 +467,14 @@ export class TileManager {
 
     for (const list of lists) {
       const def = kinds[list.meshIdx];
-      const isFoliage = list.meshIdx === 1 || list.meshIdx === 2 || list.meshIdx === 6;
-      const needsTrunk = list.meshIdx === 1 || list.meshIdx === 2 || list.meshIdx === 6;
+      const isFoliage = list.meshIdx === 1 || list.meshIdx === 2 || list.meshIdx === 6 || list.meshIdx === 7;
+      const needsTrunk = isFoliage;
+      const isFlower = list.meshIdx === 8;
       if (needsTrunk) {
         const trunks = new THREE.InstancedMesh(A.trunkGeo, A.trunkMat, list.spots.length);
         list.spots.forEach((s, i) => {
           q.setFromAxisAngle(up, s.rot);
-          v.set(s.x, s.y + 0.55 * s.scale, s.z);
+          v.set(s.x, s.y + (list.meshIdx === 7 ? 0.62 : 0.55) * s.scale, s.z);
           sc.set(s.scale, s.scale, s.scale);
           m4.compose(v, q, sc);
           trunks.setMatrixAt(i, m4);
@@ -437,7 +489,7 @@ export class TileManager {
         v.set(s.x, s.y + def.offsetY * s.scale, s.z);
         if (isFoliage) {
           const w = s.scale * (0.85 + ((i * 37) % 30) / 100);
-          sc.set(w, s.scale * 1.05, w);
+          sc.set(w, s.scale * (isFlower ? 0.8 : 1.05), w);
         } else {
           sc.set(s.scale, s.scale, s.scale);
         }
@@ -445,7 +497,16 @@ export class TileManager {
         im.setMatrixAt(i, m4);
       });
       im.instanceMatrix.needsUpdate = true;
-      im.castShadow = true;
+      im.castShadow = !isFlower; // tiny petals don't need shadow maps
+      if (isFlower) {
+        // deterministic pastel colour per spot
+        const c = new THREE.Color();
+        list.spots.forEach((s, i) => {
+          c.setHex(FLOWER_COLORS[(i * 7 + (Math.floor(s.rot * 9) % 13)) % FLOWER_COLORS.length]);
+          im.setColorAt(i, c);
+        });
+        if (im.instanceColor) im.instanceColor.needsUpdate = true;
+      }
       meshes.push(im);
     }
     return meshes;

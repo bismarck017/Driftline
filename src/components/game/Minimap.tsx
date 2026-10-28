@@ -70,7 +70,7 @@ export function Minimap({ stats }: { stats: HudStats }) {
             const rd = roadDistance(wx, wz);
             if (rd < ROAD_HALF) {
               // asphalt (slightly wider than half so thin roads stay visible)
-              r = 122; g = 117; b = 112;
+              r = 78; g = 78; b = 84;
             } else if (rd < ROAD_SHOULDER) {
               // shoulder band
               r = 200; g = 192; b = 180;
