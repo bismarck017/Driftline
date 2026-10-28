@@ -42,22 +42,32 @@ function baseHeight(x: number, z: number): number {
 }
 
 // ── Roads ────────────────────────────────────────────────────────────────────
-// A lattice of gently curving roads. "Vertical" roads run north-south with a
+// A lattice of curving country roads. "Vertical" roads run north-south with a
 // centerline x = k*SPACING + warpNS(z); "horizontal" roads run east-west with
 // z = m*SPACING + warpEW(x). Because warp is a pure function of the axis
 // coordinate, every tile evaluates identical centerlines -> perfectly
 // continuous, never-interrupted roads across any tile boundary.
+// The warp itself mixes two frequencies — long sweeping bends plus tighter
+// s-shaped squiggles — so roads read as lazy snaky country lanes instead of
+// a city grid. A larger spacing keeps crossings rare and the landscape open.
 
-export const ROAD_SPACING = 340;
+export const ROAD_SPACING = 460;
 export const ROAD_HALF = 6.0; // asphalt half width (two lanes)
 export const ROAD_SHOULDER = 16; // flatten blend distance (gentle causeway banks)
-const WARP_AMPL = 46;
+const WARP_AMPL = 118; // long sweeping bends
+const WIGGLE_AMPL = 26; // tighter s-curves laid on top
 
 function warpNS(z: number): number {
-  return (fbm1(z * 0.0032, 3, 1007) - 0.5) * 2 * WARP_AMPL;
+  return (
+    (fbm1(z * 0.0019, 3, 1007) - 0.5) * 2 * WARP_AMPL +
+    (fbm1(z * 0.0088, 2, 131) - 0.5) * 2 * WIGGLE_AMPL
+  );
 }
 function warpEW(x: number): number {
-  return (fbm1(x * 0.0031, 3, 2003) - 0.5) * 2 * WARP_AMPL;
+  return (
+    (fbm1(x * 0.0018, 3, 2003) - 0.5) * 2 * WARP_AMPL +
+    (fbm1(x * 0.0086, 2, 337) - 0.5) * 2 * WIGGLE_AMPL
+  );
 }
 
 /** Rich query about the nearest road — used for painting and physics. */
@@ -108,8 +118,8 @@ export function roadCenterEW(m: number, x: number): number {
   return m * ROAD_SPACING + warpEW(x);
 }
 
-/** Road curvature bound (warp amplitude) — used to bound candidate searches */
-export const ROAD_WARP = WARP_AMPL;
+/** Road curvature bound (total warp amplitude) — used to bound candidate searches */
+export const ROAD_WARP = WARP_AMPL + WIGGLE_AMPL;
 
 /** 1.0 on the asphalt, fading to 0 at the shoulder edge */
 export function roadMask(x: number, z: number): number {
@@ -339,6 +349,132 @@ export function isWater(x: number, z: number): boolean {
   return heightAt(x, z) < SEA_LEVEL;
 }
 
+// ── Structures (houses, barns, cabins) ──────────────────────────────────────
+// Deterministic building sites along the road network. Each road is stepped at
+// fixed world-anchored stations; a hashed RNG decides whether a station gets a
+// house, on which side, and how far from the asphalt. Sites must sit on dry,
+// flattish ground away from rivers and crossings — so little clusters of
+// pastel homes naturally appear wherever the roads cross pleasant terrain.
+
+export interface HouseSpot {
+  x: number;
+  z: number;
+  y: number;
+  rot: number; // yaw, door facing the road
+  variant: number; // 0 cottage, 1 house, 2 barn, 3 cabin
+  scale: number;
+  wall: number; // wall colour index
+  roof: number; // roof colour index
+}
+
+export const HOUSE_PALETTE_SIZE = 6; // wall/roof colour counts in the tile builder
+
+const HOUSE_STEP = 52; // metres between potential house stations along a road
+
+function tryHouse(
+  x: number,
+  z: number,
+  axis: 0 | 1,
+  side: 1 | -1,
+  rng: () => number,
+  out: HouseSpot[],
+): void {
+  const h = heightAt(x, z);
+  if (h < 1.4) return; // needs dry, firm ground (above the beach line)
+  // flatter ground only — a plinth can hide a little slope, not a hillside
+  const dh = Math.max(
+    Math.abs(heightAt(x + 2.6, z) - h),
+    Math.abs(heightAt(x - 2.6, z) - h),
+    Math.abs(heightAt(x, z + 2.6) - h),
+    Math.abs(heightAt(x, z - 2.6) - h),
+  );
+  if (dh > 0.95) return;
+  if (riverDistance(x, z) < RIVER_HALF * 3.1 + 5) return;
+  const ri = roadInfo(x, z);
+  if (ri.otherDist < ROAD_HALF + 13) return; // keep crossings clear
+  if (ri.dist < ROAD_SHOULDER + 2) return; // never on the asphalt itself
+  const tt = terrainTypeAt(x, z, h);
+  const r = rng();
+  let variant: number;
+  if (tt === "meadow") variant = r < 0.42 ? 0 : r < 0.8 ? 1 : 2;
+  else if (tt === "forest") variant = r < 0.72 ? 3 : 0;
+  else if (tt === "highlands") variant = r < 0.85 ? 3 : 0;
+  else if (tt === "snow") variant = 3; // cosy cabins in the snowfield
+  else if (tt === "desert") variant = r < 0.6 ? 1 : 0;
+  else return; // no buildings on beaches or in the water
+  const jitter = (rng() - 0.5) * 0.22;
+  // door (local +z) faces back toward the road it serves
+  const rot =
+    axis === 0
+      ? -side * Math.PI * 0.5 + jitter
+      : (side > 0 ? Math.PI : 0) + jitter;
+  out.push({
+    x,
+    z,
+    y: surfaceHeightAt(x, z) - 0.15, // plinth sinks slightly into the ground
+    rot,
+    variant,
+    scale: 0.92 + rng() * 0.2,
+    wall: Math.floor(rng() * HOUSE_PALETTE_SIZE) % HOUSE_PALETTE_SIZE,
+    roof: Math.floor(rng() * HOUSE_PALETTE_SIZE) % HOUSE_PALETTE_SIZE,
+  });
+}
+
+function houseSitesForCell(ti: number, tj: number): HouseSpot[] {
+  const ox = ti * TILE;
+  const oz = tj * TILE;
+  const spots: HouseSpot[] = [];
+  // Every station belongs to exactly ONE cell: the cell containing its station
+  // POINT (the point on the centerline). Anchoring by the along-axis coordinate
+  // alone would make every cell in the same row rebuild the same house.
+  const inX = (x: number) => x >= ox && x < ox + TILE;
+  const inZ = (z: number) => z >= oz && z < oz + TILE;
+  // north-south roads: house stations along z
+  const kMin = Math.floor((ox - ROAD_WARP) / ROAD_SPACING) - 1;
+  const kMax = Math.ceil((ox + TILE + ROAD_WARP) / ROAD_SPACING) + 1;
+  for (let k = kMin; k <= kMax; k++) {
+    const jMin = Math.floor((oz - ROAD_WARP) / HOUSE_STEP);
+    const jMax = Math.ceil((oz + TILE + ROAD_WARP) / HOUSE_STEP);
+    for (let j = jMin; j <= jMax; j++) {
+      const z = j * HOUSE_STEP;
+      const x0 = roadCenterNS(k, z);
+      if (!inX(x0) || !inZ(z)) continue;
+      const rng = mulberry32(
+        (Math.imul(k, 0x27d4eb2d) ^ Math.imul(j, 0x165667b1) ^ 0x51ce) >>> 0,
+      );
+      if (rng() >= 0.6) continue;
+      const side = rng() < 0.5 ? -1 : 1;
+      const lat = ROAD_SHOULDER + 7 + rng() * 17;
+      tryHouse(x0 + side * lat, z, 0, side, rng, spots);
+    }
+  }
+  // east-west roads: stations along x
+  const mMin = Math.floor((oz - ROAD_WARP) / ROAD_SPACING) - 1;
+  const mMax = Math.ceil((oz + TILE + ROAD_WARP) / ROAD_SPACING) + 1;
+  for (let m = mMin; m <= mMax; m++) {
+    const jMin = Math.floor((ox - ROAD_WARP) / HOUSE_STEP);
+    const jMax = Math.ceil((ox + TILE + ROAD_WARP) / HOUSE_STEP);
+    for (let j = jMin; j <= jMax; j++) {
+      const x = j * HOUSE_STEP;
+      const z0 = roadCenterEW(m, x);
+      if (!inX(x) || !inZ(z0)) continue;
+      const rng = mulberry32(
+        (Math.imul(m, 0x9e3779b1) ^ Math.imul(j, 0x85ebca6b) ^ 0x4a11) >>> 0,
+      );
+      if (rng() >= 0.6) continue;
+      const side = rng() < 0.5 ? -1 : 1;
+      const lat = ROAD_SHOULDER + 7 + rng() * 17;
+      tryHouse(x, z0 + side * lat, 1, side, rng, spots);
+    }
+  }
+  return spots;
+}
+
+/** Deterministic structures anchored in this tile (rendered by the tile builder). */
+export function structuresForTile(ti: number, tj: number): HouseSpot[] {
+  return houseSitesForCell(ti, tj);
+}
+
 // ── Props placement (trees, rocks…) ───────────────────────────────────────────
 
 export interface PropSpot {
@@ -348,7 +484,7 @@ export interface PropSpot {
   scale: number;
   rot: number;
   kind: number; // 0 round tree, 1 pine, 2 bush, 3 rock, 4 cactus, 5 snowy tree,
-  //            6 wildflower, 7 tall pine
+  //            6 wildflower, 7 tall pine, 8 palm
 }
 
 /**
@@ -361,6 +497,7 @@ export interface PropSpot {
  *  · meadows mix scattered groves, wildflowers and bushes;
  *  · roads keep a wide clear margin so no canopy or cactus ever touches the
  *    asphalt; rivers and water are kept clear too;
+ *  · buildings and their yards are kept clear too (3x3 cell search);
  *  · every prop sits on the RENDERED surface (surfaceHeightAt) so nothing
  *    hovers above or sinks below the visible mesh;
  *  · steep slopes reject plants (rocks don't mind them).
@@ -368,7 +505,13 @@ export interface PropSpot {
 export function propsForTile(ti: number, tj: number): PropSpot[] {
   const rng = mulberry32((Math.imul(ti, 73856093) ^ Math.imul(tj, 19349663)) >>> 0);
   const spots: PropSpot[] = [];
-  const attempts = 210;
+  // structures in the 3x3 neighbourhood — trees never grow through a building
+  const houses: HouseSpot[] = [];
+  for (let dj = -1; dj <= 1; dj++)
+    for (let di = -1; di <= 1; di++)
+      houses.push(...houseSitesForCell(ti + di, tj + dj));
+
+  const attempts = 520; // ~2.5x the old density; cluster fields keep glades open
   for (let i = 0; i < attempts; i++) {
     const x = (ti + rng()) * TILE;
     const z = (tj + rng()) * TILE;
@@ -377,6 +520,18 @@ export function propsForTile(ti: number, tj: number): PropSpot[] {
     // wide margin around roads: no vegetation on or over the asphalt
     if (roadDistance(x, z) < ROAD_SHOULDER + 4) continue;
     if (riverDistance(x, z) < RIVER_HALF * 3.1 + 4) continue;
+    // keep clear of houses and their little yards
+    let blocked = false;
+    for (const hs of houses) {
+      const dx = x - hs.x;
+      const dz = z - hs.z;
+      const rad = 9 + hs.scale * 4;
+      if (dx * dx + dz * dz < rad * rad) {
+        blocked = true;
+        break;
+      }
+    }
+    if (blocked) continue;
 
     const tt = terrainTypeAt(x, z, h);
     // grove / glade mask — drives clustering AND clearings
@@ -384,35 +539,37 @@ export function propsForTile(ti: number, tj: number): PropSpot[] {
     let kind = -1;
     if (tt === "forest") {
       // dense woodland in high-cluster zones, natural glades in low ones
-      const dense = cluster > 0.34 ? 0.95 : 0.3;
+      const dense = cluster > 0.32 ? 0.96 : 0.34;
       if (rng() < dense) {
         const r = rng();
         // old-growth cores favor tall pines, elsewhere pine/round mix
-        kind = cluster > 0.58 && r < 0.4 ? 7 : r < 0.55 ? 1 : 0;
+        kind = cluster > 0.56 && r < 0.42 ? 7 : r < 0.5 ? 1 : 0;
       } else if (rng() < 0.35) {
         kind = 2; // bushes fill the glades
       }
     } else if (tt === "meadow") {
-      const grove = smoothstep(0.5, 0.72, cluster);
+      const grove = smoothstep(0.48, 0.7, cluster);
       const r = rng();
-      const treeP = 0.06 + 0.5 * grove; // open meadows stay open
+      const treeP = 0.07 + 0.55 * grove; // open meadows stay open
       if (r < treeP) kind = rng() < 0.35 ? 1 : rng() < 0.6 ? 0 : 7;
-      else if (r < treeP + 0.26) kind = 6; // wildflower carpets
-      else if (r < treeP + 0.36) kind = 2;
+      else if (r < treeP + 0.3) kind = 6; // wildflower carpets
+      else if (r < treeP + 0.4) kind = 2;
     } else if (tt === "beach") {
-      if (rng() < 0.06) kind = 3;
-      else if (rng() < 0.04) kind = 2;
+      const r = rng();
+      if (r < 0.16) kind = 8; // palms leaning over the sand
+      else if (r < 0.21) kind = 3;
+      else if (r < 0.24) kind = 2;
     } else if (tt === "desert") {
       const patch = smoothstep(0.42, 0.7, cluster);
       const r = rng();
-      if (r < 0.12 + 0.55 * patch) kind = 4; // cactus in patches
-      else if (r < 0.26 + 0.55 * patch) kind = 3;
+      if (r < 0.14 + 0.6 * patch) kind = 4; // cactus in patches
+      else if (r < 0.3 + 0.6 * patch) kind = 3;
     } else if (tt === "highlands") {
       const r = rng();
-      if (r < 0.4) kind = 3;
-      else if (r < 0.4 + (cluster > 0.52 ? 0.3 : 0.06)) kind = 1;
+      if (r < 0.36) kind = 3;
+      else if (r < 0.36 + (cluster > 0.5 ? 0.32 : 0.08)) kind = 1;
     } else if (tt === "snow") {
-      const p = cluster > 0.55 ? 0.5 : 0.12;
+      const p = cluster > 0.55 ? 0.55 : 0.16;
       if (rng() < p) kind = 5;
     }
     if (kind < 0) continue;
@@ -428,7 +585,7 @@ export function propsForTile(ti: number, tj: number): PropSpot[] {
       z,
       // sit on the RENDERED surface, never the analytic one (anti float/sink)
       y: surfaceHeightAt(x, z),
-      scale: kind === 6 ? 0.8 + rng() * 0.7 : 0.75 + rng() * 0.6,
+      scale: kind === 6 ? 0.8 + rng() * 0.7 : kind === 8 ? 0.9 + rng() * 0.5 : 0.75 + rng() * 0.6,
       rot: rng() * Math.PI * 2,
       kind,
     });

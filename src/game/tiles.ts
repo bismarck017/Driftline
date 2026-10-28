@@ -13,6 +13,7 @@ import {
   surfaceHeightAt,
   terrainColorAt,
   propsForTile,
+  structuresForTile,
   roadInfo,
   roadCenterNS,
   roadCenterEW,
@@ -22,9 +23,16 @@ import {
   TERRAIN_SEGMENTS,
   TERRAIN_GRID,
   type PropSpot,
+  type HouseSpot,
 } from "./world";
 
 // Shared, never-disposed prop assets ─────────────────────────────────────────
+interface HouseAssets {
+  wallGeo: THREE.BoxGeometry; // origin at wall base
+  roofGeo: THREE.ConeGeometry; // pyramid, aligned with the walls
+  detailGeo: THREE.BufferGeometry; // plinth + door + windows, vertex-coloured
+}
+
 interface PropAssets {
   trunkGeo: THREE.CylinderGeometry;
   roundGeo: THREE.IcosahedronGeometry;
@@ -34,6 +42,8 @@ interface PropAssets {
   bushGeo: THREE.IcosahedronGeometry;
   rockGeo: THREE.IcosahedronGeometry;
   cactusGeo: THREE.CapsuleGeometry;
+  palmGeo: THREE.BufferGeometry;
+  houses: HouseAssets[];
   trunkMat: THREE.MeshStandardMaterial;
   leafMat: THREE.MeshStandardMaterial;
   leafDarkMat: THREE.MeshStandardMaterial;
@@ -43,10 +53,98 @@ interface PropAssets {
   rockMat: THREE.MeshStandardMaterial;
   cactusMat: THREE.MeshStandardMaterial;
   snowLeafMat: THREE.MeshStandardMaterial;
+  palmMat: THREE.MeshStandardMaterial;
+  wallMat: THREE.MeshStandardMaterial;
+  roofMat: THREE.MeshStandardMaterial;
+  detailMat: THREE.MeshStandardMaterial;
 }
 
 // Pastel wildflower palette — applied per-instance (deterministic per spot)
 const FLOWER_COLORS = [0xf2a7c3, 0xe2b4f0, 0xf7e6a0, 0xf5b8a0, 0xbcdcf2, 0xf0f0e6];
+
+// Pastel building palettes — matched to HOUSE_PALETTE_SIZE in world.ts
+const HOUSE_WALLS = [0xfff3dd, 0xf7dce2, 0xdcefe0, 0xd6e6f2, 0xf6e8c8, 0xe6dff2];
+const HOUSE_ROOFS = [0xe28f74, 0xcf7a68, 0x84a8a4, 0xa98fb8, 0x91a0b8, 0xb8b0a0];
+
+// House variant footprints: 0 cottage, 1 house, 2 barn, 3 cabin
+const HOUSE_DEFS = [
+  { w: 4.6, d: 3.8, h: 2.5, roofH: 2.0, doorX: 0, windows: [-1.3, 1.3], barnDoor: false },
+  { w: 5.6, d: 4.6, h: 2.9, roofH: 2.4, doorX: -0.8, windows: [-2.2, 0.6], barnDoor: false },
+  { w: 6.6, d: 5.0, h: 3.2, roofH: 3.0, doorX: 0, windows: [], barnDoor: true },
+  { w: 4.0, d: 3.3, h: 2.2, roofH: 1.7, doorX: 0, windows: [1.05], barnDoor: false },
+];
+
+/** Bake a flat vertex colour into a geometry (lets one merged mesh hold many colours). */
+function bakeColor(geo: THREE.BufferGeometry, r: number, g: number, b: number) {
+  const n = geo.attributes.position.count;
+  const arr = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    arr[i * 3] = r;
+    arr[i * 3 + 1] = g;
+    arr[i * 3 + 2] = b;
+  }
+  geo.setAttribute("color", new THREE.BufferAttribute(arr, 3));
+}
+
+/** One palm tree as a single vertex-coloured geometry: tilted trunk + fronds. */
+function buildPalmGeo(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  const trunk = new THREE.CylinderGeometry(0.13, 0.22, 2.7, 5);
+  trunk.translate(0, 1.35, 0);
+  trunk.rotateZ(0.16); // gentle lean
+  bakeColor(trunk, 0.56, 0.42, 0.32);
+  parts.push(trunk);
+  for (let i = 0; i < 6; i++) {
+    const frond = new THREE.ConeGeometry(0.4, 2.5, 4);
+    frond.scale(1, 1, 0.2); // flatten into a blade
+    frond.rotateX(1.25); // lay it outward, tips reaching up
+    frond.translate(-0.42, 2.62, 0); // trunk top
+    frond.rotateY((i / 6) * Math.PI * 2 + 0.35);
+    bakeColor(frond, 0.55, 0.78, 0.6);
+    parts.push(frond);
+  }
+  const merged = mergeGeometries(parts, false)!;
+  parts.forEach((p) => p.dispose());
+  return merged;
+}
+
+/** Walls + pyramid roof + baked-colour details (plinth, door, windows) for one variant. */
+function buildHouseAssets(def: (typeof HOUSE_DEFS)[number]): HouseAssets {
+  const { w, d, h, roofH, doorX } = def;
+  const wallGeo = new THREE.BoxGeometry(w, h, d);
+  wallGeo.translate(0, h / 2, 0); // base at y=0
+  // 4-sided pyramid roof: square base aligned with the walls, slight overhang
+  const roofGeo = new THREE.ConeGeometry(Math.SQRT1_2 * (Math.max(w, d) + 1.0), roofH, 4);
+  roofGeo.rotateY(Math.PI / 4);
+  roofGeo.translate(0, h + roofH / 2 - 0.12, 0);
+
+  const parts: THREE.BufferGeometry[] = [];
+  // plinth: a wide skirt that sinks into the ground, hiding slope gaps
+  const plinth = new THREE.BoxGeometry(w + 0.9, 0.95, d + 0.9);
+  plinth.translate(0, -0.18, 0);
+  bakeColor(plinth, 0.45, 0.42, 0.4);
+  parts.push(plinth);
+  if (def.barnDoor) {
+    const bd = new THREE.BoxGeometry(2.3, 2.5, 0.2);
+    bd.translate(doorX, 1.45, d / 2 + 0.05);
+    bakeColor(bd, 0.58, 0.36, 0.3);
+    parts.push(bd);
+  } else {
+    const door = new THREE.BoxGeometry(0.95, 1.7, 0.2);
+    door.translate(doorX, 1.13, d / 2 + 0.05);
+    bakeColor(door, 0.5, 0.35, 0.27);
+    parts.push(door);
+  }
+  for (const wx of def.windows) {
+    const win = new THREE.BoxGeometry(0.8, 0.72, 0.18);
+    win.translate(wx, 1.75, d / 2 + 0.04);
+    bakeColor(win, 0.9, 0.94, 0.98);
+    parts.push(win);
+  }
+  const detailGeo = mergeGeometries(parts, false)!;
+  parts.forEach((p) => p.dispose());
+  return { wallGeo, roofGeo, detailGeo };
+}
 
 let assets: PropAssets | null = null;
 
@@ -61,6 +159,8 @@ function getAssets(): PropAssets {
     bushGeo: new THREE.IcosahedronGeometry(0.62, 0),
     rockGeo: new THREE.IcosahedronGeometry(0.85, 0),
     cactusGeo: new THREE.CapsuleGeometry(0.4, 1.4, 4, 8),
+    palmGeo: buildPalmGeo(),
+    houses: HOUSE_DEFS.map(buildHouseAssets),
     trunkMat: new THREE.MeshStandardMaterial({ color: 0x9c7b63, roughness: 0.9, flatShading: true }),
     leafMat: new THREE.MeshStandardMaterial({ color: 0x8fce8f, roughness: 0.9, flatShading: true }),
     leafDarkMat: new THREE.MeshStandardMaterial({ color: 0x6ea86f, roughness: 0.9, flatShading: true }),
@@ -70,6 +170,10 @@ function getAssets(): PropAssets {
     rockMat: new THREE.MeshStandardMaterial({ color: 0xbcb4a8, roughness: 0.95, flatShading: true }),
     cactusMat: new THREE.MeshStandardMaterial({ color: 0x9ec49a, roughness: 0.9, flatShading: true }),
     snowLeafMat: new THREE.MeshStandardMaterial({ color: 0xe8f0ea, roughness: 0.9, flatShading: true }),
+    palmMat: new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.95, flatShading: true }),
+    wallMat: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, flatShading: true }),
+    roofMat: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, flatShading: true }),
+    detailMat: new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.95, flatShading: true }),
   };
   return assets;
 }
@@ -284,8 +388,20 @@ export class TileManager {
       disposables.push(wgeo, wmat);
     }
 
-    // ── props ──
-    const props = this.buildProps(propsForTile(ti, tj));
+    // ── props + structures ──
+    // The tile group is later placed at the tile CENTRE, so every instance
+    // position must be LOCAL: (world - centre). Props are placed from world
+    // coordinates, hence the cx/cz subtraction here (same frame as the road
+    // markings) — otherwise trees would render shifted from the spot their
+    // height was sampled at (the classic hover/sink bug).
+    const cx = ox + TILE / 2;
+    const cz = oz + TILE / 2;
+    const props = this.buildProps(propsForTile(ti, tj), cx, cz);
+    const structures = this.buildStructures(structuresForTile(ti, tj), cx, cz);
+    structures.forEach((m) => {
+      group.add(m);
+      props.push(m); // disposed together with the tile
+    });
     props.forEach((p) => group.add(p));
 
     // ── road markings (dashed centerlines + lane edges as real geometry) ──
@@ -432,7 +548,7 @@ export class TileManager {
     return mesh;
   }
 
-  private buildProps(spots: PropSpot[]): THREE.InstancedMesh[] {
+  private buildProps(spots: PropSpot[], cx: number, cz: number): THREE.InstancedMesh[] {
     if (spots.length === 0) return [];
     const A = getAssets();
     const kinds = [
@@ -445,9 +561,10 @@ export class TileManager {
       { geo: A.roundGeo, mat: A.snowLeafMat, offsetY: 1.75 },  // 6 snowy tree
       { geo: A.tallPineGeo, mat: A.pineDeepMat, offsetY: 2.7 },// 7 tall pine
       { geo: A.flowerGeo, mat: A.flowerMat, offsetY: 0.1 },     // 8 wildflower
+      { geo: A.palmGeo, mat: A.palmMat, offsetY: 0 },          // 9 palm (merged, self-coloured)
     ];
     // kind mapping from PropSpot.kind -> asset index
-    const kindMap: Record<number, number> = { 0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 8, 7: 7 };
+    const kindMap: Record<number, number> = { 0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 8, 7: 7, 8: 9 };
     const lists: { meshIdx: number; spots: PropSpot[] }[] = [];
     for (const s of spots) {
       let li = lists.find((l) => l.meshIdx === kindMap[s.kind]);
@@ -474,7 +591,7 @@ export class TileManager {
         const trunks = new THREE.InstancedMesh(A.trunkGeo, A.trunkMat, list.spots.length);
         list.spots.forEach((s, i) => {
           q.setFromAxisAngle(up, s.rot);
-          v.set(s.x, s.y + (list.meshIdx === 7 ? 0.62 : 0.55) * s.scale, s.z);
+          v.set(s.x - cx, s.y + (list.meshIdx === 7 ? 0.62 : 0.55) * s.scale, s.z - cz);
           sc.set(s.scale, s.scale, s.scale);
           m4.compose(v, q, sc);
           trunks.setMatrixAt(i, m4);
@@ -486,7 +603,7 @@ export class TileManager {
       const im = new THREE.InstancedMesh(def.geo, def.mat, list.spots.length);
       list.spots.forEach((s, i) => {
         q.setFromAxisAngle(up, s.rot);
-        v.set(s.x, s.y + def.offsetY * s.scale, s.z);
+        v.set(s.x - cx, s.y + def.offsetY * s.scale, s.z - cz);
         if (isFoliage) {
           const w = s.scale * (0.85 + ((i * 37) % 30) / 100);
           sc.set(w, s.scale * (isFlower ? 0.8 : 1.05), w);
@@ -508,6 +625,65 @@ export class TileManager {
         if (im.instanceColor) im.instanceColor.needsUpdate = true;
       }
       meshes.push(im);
+    }
+    return meshes;
+  }
+
+  /**
+   * Houses / barns / cabins as instance meshes, one trio (walls, roof,
+   * baked details) per variant. Walls and roofs get deterministic pastel
+   * tints per spot; the plinth skirt sinks into the ground so nothing
+   * floats even on a gentle slope.
+   */
+  private buildStructures(spots: HouseSpot[], cx: number, cz: number): THREE.InstancedMesh[] {
+    if (spots.length === 0) return [];
+    const A = getAssets();
+    const byVariant = new Map<number, HouseSpot[]>();
+    for (const s of spots) {
+      const list = byVariant.get(s.variant);
+      if (list) list.push(s);
+      else byVariant.set(s.variant, [s]);
+    }
+    const meshes: THREE.InstancedMesh[] = [];
+    const m4 = new THREE.Matrix4();
+    const q = new THREE.Quaternion();
+    const up = new THREE.Vector3(0, 1, 0);
+    const v = new THREE.Vector3();
+    const sc = new THREE.Vector3();
+    const col = new THREE.Color();
+    for (const [variant, list] of byVariant) {
+      const def = A.houses[variant];
+      if (!def) continue;
+      const n = list.length;
+      const walls = new THREE.InstancedMesh(def.wallGeo, A.wallMat, n);
+      const roofs = new THREE.InstancedMesh(def.roofGeo, A.roofMat, n);
+      const details = new THREE.InstancedMesh(def.detailGeo, A.detailMat, n);
+      const place = (im: THREE.InstancedMesh, i: number, s: HouseSpot) => {
+        q.setFromAxisAngle(up, s.rot);
+        v.set(s.x - cx, s.y, s.z - cz);
+        sc.set(s.scale, s.scale, s.scale);
+        m4.compose(v, q, sc);
+        im.setMatrixAt(i, m4);
+      };
+      list.forEach((s, i) => {
+        place(walls, i, s);
+        place(roofs, i, s);
+        place(details, i, s);
+        col.setHex(HOUSE_WALLS[s.wall % HOUSE_WALLS.length]);
+        walls.setColorAt(i, col);
+        col.setHex(HOUSE_ROOFS[s.roof % HOUSE_ROOFS.length]);
+        roofs.setColorAt(i, col);
+      });
+      walls.instanceMatrix.needsUpdate = true;
+      roofs.instanceMatrix.needsUpdate = true;
+      details.instanceMatrix.needsUpdate = true;
+      if (walls.instanceColor) walls.instanceColor.needsUpdate = true;
+      if (roofs.instanceColor) roofs.instanceColor.needsUpdate = true;
+      for (const im of [walls, roofs, details]) {
+        im.castShadow = true;
+        im.receiveShadow = true;
+        meshes.push(im);
+      }
     }
     return meshes;
   }
