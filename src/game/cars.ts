@@ -1,11 +1,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// The four selectable cars, each built procedurally from rounded low-poly
-// geometry with clearcoat paint, slanted glass, spoked wheels, mirrors,
-// grilles, exhausts and fender flares — a tactile, premium modelled feel.
+// The four selectable cars, modelled as stylized low-poly silhouettes.
+// Each body is a single extruded side-profile (with real wheel arches cut
+// into the outline) instead of stacked boxes — clean, chunky, deliberate.
+//   Coastline — Volvo V60-inspired Scandinavian sport wagon
+//   Highland  — Lexus GX-inspired boxy adventure SUV
+//   Mesa      — Rivian R1T-inspired electric pickup
+//   Blossom   — Porsche 911-inspired fastback coupe
 // All cars face +Z in local space; origin sits between the wheels at ground.
 // ─────────────────────────────────────────────────────────────────────────────
 import * as THREE from "three";
-import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 
 export interface CarStats {
   /** top speed in m/s */
@@ -40,7 +43,7 @@ export const CARS: CarSpec[] = [
   {
     id: "sedan",
     name: "Coastline",
-    tag: "Balanced everyday cruiser",
+    tag: "Scandinavian sport wagon",
     body: "#b7cbdd",
     roof: "#f2efe7",
     accent: "#7f94a8",
@@ -49,13 +52,13 @@ export const CARS: CarSpec[] = [
     clearance: 0.3,
     wheelR: 0.36,
     wheelW: 0.26,
-    wheelBase: 1.42,
+    wheelBase: 1.4,
     track: 0.82,
   },
   {
     id: "suv",
     name: "Highland",
-    tag: "Go-anywhere adventure wagon",
+    tag: "Boxy go-anywhere SUV",
     body: "#c9d8b6",
     roof: "#eef0e6",
     accent: "#8aa07a",
@@ -64,13 +67,13 @@ export const CARS: CarSpec[] = [
     clearance: 0.46,
     wheelR: 0.44,
     wheelW: 0.32,
-    wheelBase: 1.42,
+    wheelBase: 1.46,
     track: 0.86,
   },
   {
     id: "truck",
     name: "Mesa",
-    tag: "Heavy, honest, unstoppable",
+    tag: "Quiet, capable electric pickup",
     body: "#e3b39a",
     roof: "#f5ece4",
     accent: "#b5836a",
@@ -79,13 +82,13 @@ export const CARS: CarSpec[] = [
     clearance: 0.48,
     wheelR: 0.46,
     wheelW: 0.36,
-    wheelBase: 1.45,
+    wheelBase: 1.5,
     track: 0.86,
   },
   {
     id: "sport",
     name: "Blossom",
-    tag: "Low, wide, and very quick",
+    tag: "Rear-engined icon, but pastel",
     body: "#f0aec0",
     roof: "#fbdce4",
     accent: "#d98da3",
@@ -94,8 +97,8 @@ export const CARS: CarSpec[] = [
     clearance: 0.24,
     wheelR: 0.34,
     wheelW: 0.3,
-    wheelBase: 1.38,
-    track: 0.86,
+    wheelBase: 1.24,
+    track: 0.92,
   },
 ];
 
@@ -107,30 +110,28 @@ export interface BuiltCar {
 
 // ── material helpers ─────────────────────────────────────────────────────────
 
-function paintMat(color: string): THREE.MeshPhysicalMaterial {
-  return new THREE.MeshPhysicalMaterial({
+/** Matte stylized paint — reads as low-poly under the pastel world lighting. */
+function paintMat(color: string): THREE.MeshStandardMaterial {
+  return new THREE.MeshStandardMaterial({
     color,
-    roughness: 0.32,
-    metalness: 0.12,
-    clearcoat: 0.65,
-    clearcoatRoughness: 0.22,
+    roughness: 0.42,
+    metalness: 0.05,
+    flatShading: true,
   });
 }
 
-function rbox(w: number, h: number, d: number, r: number): RoundedBoxGeometry {
-  return new RoundedBoxGeometry(w, h, d, 2, Math.min(r, w / 2.01, h / 2.01, d / 2.01));
-}
-
-function add(
+function box(
   parent: THREE.Object3D,
-  geo: THREE.BufferGeometry,
+  w: number,
+  h: number,
+  d: number,
   material: THREE.Material,
   x: number,
   y: number,
   z: number,
   rx = 0
 ): THREE.Mesh {
-  const m = new THREE.Mesh(geo, material);
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
   m.position.set(x, y, z);
   if (rx) m.rotation.x = rx;
   m.castShadow = true;
@@ -138,91 +139,82 @@ function add(
   return m;
 }
 
-// ── wheels ───────────────────────────────────────────────────────────────────
+// ── side-profile extrusion ───────────────────────────────────────────────────
 
-function buildWheel(spec: CarSpec, tireMat: THREE.Material, rimMat: THREE.Material, trimMat: THREE.Material): THREE.Group {
+type ProfileCmd =
+  | { p: [number, number] } // straight line to (z, y)
+  | { arch: { z: number; y: number; r: number; bottom: number } }; // wheel arch
+
+/**
+ * Builds a solid car body from its side silhouette. The outline is drawn in
+ * (z, y) space — z runs along the car (+z = nose), y is height — then extruded
+ * across the width and centered on x = 0.
+ */
+function extrudeProfile(
+  cmds: ProfileCmd[],
+  width: number,
+  material: THREE.Material
+): THREE.Mesh {
+  const shape = new THREE.Shape();
+  const first = cmds[0];
+  if (!first || !("p" in first)) throw new Error("profile must start with a point");
+  shape.moveTo(first.p[0], first.p[1]);
+
+  for (let i = 1; i < cmds.length; i++) {
+    const c = cmds[i];
+    if ("p" in c) {
+      shape.lineTo(c.p[0], c.p[1]);
+    } else {
+      const { z, y, r, bottom } = c.arch;
+      // angle below horizontal where the arch meets the rocker line
+      const dy = Math.max(0, y - bottom);
+      const a = Math.asin(Math.min(1, dy / r));
+      // walk to the arch opening (lineTo keeps arcs crisp and kink-free)
+      shape.lineTo(z - r * Math.cos(a), bottom);
+      // upper arc over the wheel, traversed clockwise (from +z side to -z side)
+      shape.absarc(z, y, r, Math.PI + a, -a, true);
+    }
+  }
+  shape.closePath();
+
+  const geo = new THREE.ExtrudeGeometry(shape, {
+    depth: width,
+    bevelEnabled: false,
+    curveSegments: 6,
+  });
+  // shape-x → car-z, extrusion → car-x, centered
+  geo.rotateY(-Math.PI / 2);
+  geo.translate(width / 2, 0, 0);
+
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.castShadow = true;
+  return mesh;
+}
+
+// ── wheels: chunky flat-shaded drums ─────────────────────────────────────────
+
+function buildWheel(spec: CarSpec, tireMat: THREE.Material, rimMat: THREE.Material): THREE.Group {
   const r = spec.wheelR;
   const w = spec.wheelW;
   const spin = new THREE.Group();
 
-  // tire
-  const tireGeo = new THREE.CylinderGeometry(r, r, w, 18);
+  const tireGeo = new THREE.CylinderGeometry(r, r, w, 10);
   tireGeo.rotateZ(Math.PI / 2);
   const tire = new THREE.Mesh(tireGeo, tireMat);
   tire.castShadow = true;
   spin.add(tire);
 
-  // sidewall discs (slightly inset, lighter than the tread) so the wheels
-  // read clearly against the soft contact shadow
-  const sideGeo = new THREE.CylinderGeometry(r * 0.82, r * 0.82, w + 0.015, 16);
-  sideGeo.rotateZ(Math.PI / 2);
-  const sideMat = new THREE.MeshStandardMaterial({ color: "#6b6470", roughness: 0.7 });
-  const side = new THREE.Mesh(sideGeo, sideMat);
-  spin.add(side);
-
-  // rim dish
-  const rimGeo = new THREE.CylinderGeometry(r * 0.6, r * 0.6, w * 0.58, 14);
+  // rim pokes just past the tire sidewall on both faces
+  const rimGeo = new THREE.CylinderGeometry(r * 0.58, r * 0.58, w * 1.06, 10);
   rimGeo.rotateZ(Math.PI / 2);
-  spin.add(new THREE.Mesh(rimGeo, rimMat));
+  const rim = new THREE.Mesh(rimGeo, rimMat);
+  spin.add(rim);
 
-  // five spokes
-  for (let i = 0; i < 5; i++) {
-    const spokeGeo = new THREE.BoxGeometry(w * 0.5, r * 1.05, 0.055);
-    const spoke = new THREE.Mesh(spokeGeo, rimMat);
-    spoke.rotation.x = (i / 5) * Math.PI * 2;
-    spin.add(spoke);
-  }
-
-  // chrome hub
-  const hubGeo = new THREE.CylinderGeometry(r * 0.14, r * 0.14, w * 0.72, 10);
+  const hubGeo = new THREE.CylinderGeometry(r * 0.18, r * 0.18, w * 1.1, 8);
   hubGeo.rotateZ(Math.PI / 2);
   spin.add(new THREE.Mesh(hubGeo, rimMat));
 
   return spin;
-}
-
-// ── shared premium details ───────────────────────────────────────────────────
-
-interface CarKit {
-  glassMat: THREE.Material;
-  trimMat: THREE.Material;
-  chromeMat: THREE.Material;
-  lightMat: THREE.Material;
-  tailMat: THREE.Material;
-  accentMat: THREE.Material;
-  roofMat: THREE.Material;
-  bodyMat: THREE.Material;
-}
-
-function addMirrors(kit: CarKit, g: THREE.Object3D, x: number, y: number, z: number): void {
-  for (const sx of [-1, 1]) {
-    add(g, rbox(0.05, 0.05, 0.1, 0.02), kit.trimMat, sx * (x + 0.07), y, z + 0.06);
-    add(g, rbox(0.05, 0.11, 0.17, 0.02), kit.trimMat, sx * (x + 0.12), y + 0.03, z);
-  }
-}
-
-function addFlares(kit: CarKit, g: THREE.Object3D, spec: CarSpec): void {
-  const flareGeo = rbox(spec.wheelW * 1.55, 0.14, spec.wheelR * 1.7, 0.05);
-  for (const wz of [spec.wheelBase, -spec.wheelBase]) {
-    for (const sx of [-1, 1]) {
-      add(g, flareGeo, kit.trimMat, sx * (spec.track + 0.02), spec.wheelR + spec.clearance * 0.42, wz);
-    }
-  }
-}
-
-function addExhausts(kit: CarKit, g: THREE.Object3D, spec: CarSpec, tailZ: number, count: number): void {
-  const pipeGeo = new THREE.CylinderGeometry(0.055, 0.055, 0.16, 10);
-  pipeGeo.rotateX(Math.PI / 2);
-  const y = spec.wheelR + 0.08;
-  if (count === 1) {
-    add(g, pipeGeo, kit.chromeMat, 0.45, y, tailZ + 0.02);
-  } else {
-    for (const sx of [-1, 1]) {
-      for (const dx of [0, 0.16]) {
-        add(g, pipeGeo, kit.chromeMat, sx * (0.35 + dx), y, tailZ + 0.02);
-      }
-    }
-  }
 }
 
 // ── the car builder ───────────────────────────────────────────────────────────
@@ -230,41 +222,39 @@ function addExhausts(kit: CarKit, g: THREE.Object3D, spec: CarSpec, tailZ: numbe
 export function buildCar(spec: CarSpec): BuiltCar {
   const g = new THREE.Group();
 
-  const kit: CarKit = {
+  const kit = {
     bodyMat: paintMat(spec.body),
     roofMat: paintMat(spec.roof),
     accentMat: paintMat(spec.accent),
-    glassMat: new THREE.MeshPhysicalMaterial({
-      color: "#2c3744",
-      roughness: 0.07,
-      metalness: 0.25,
-      clearcoat: 1,
-      clearcoatRoughness: 0.06,
+    glassMat: new THREE.MeshStandardMaterial({
+      color: "#2e3a46",
+      roughness: 0.16,
+      metalness: 0.35,
+      flatShading: true,
     }),
-    trimMat: new THREE.MeshStandardMaterial({ color: "#45414a", roughness: 0.55, metalness: 0.2 }),
-    chromeMat: new THREE.MeshStandardMaterial({ color: "#d9d5cc", roughness: 0.28, metalness: 0.85 }),
+    trimMat: new THREE.MeshStandardMaterial({ color: "#3c3a42", roughness: 0.6, flatShading: true }),
     lightMat: new THREE.MeshStandardMaterial({
       color: "#fff6dc",
       emissive: "#ffeec2",
-      emissiveIntensity: 0.85,
+      emissiveIntensity: 0.9,
       roughness: 0.35,
+      flatShading: true,
     }),
     tailMat: new THREE.MeshStandardMaterial({
       color: "#f0908c",
       emissive: "#e26d6d",
-      emissiveIntensity: 0.6,
+      emissiveIntensity: 0.65,
       roughness: 0.4,
+      flatShading: true,
     }),
   };
 
-  const wheelR = spec.wheelR;
-  // the group origin sits at GROUND level (wheel contact plane), so the
-  // body bottom floats just `clearance` above the tarmac
-  const groundY = spec.clearance;
+  const tireMat = new THREE.MeshStandardMaterial({ color: "#3b383e", roughness: 0.9, flatShading: true });
+  const rimMat = new THREE.MeshStandardMaterial({ color: "#efe9dd", roughness: 0.35, metalness: 0.35, flatShading: true });
 
-  // wheels first (they define the stance)
-  const tireMat = new THREE.MeshStandardMaterial({ color: "#3b383e", roughness: 0.88 });
-  const rimMat = new THREE.MeshStandardMaterial({ color: "#efe9dd", roughness: 0.3, metalness: 0.4 });
+  const wheelR = spec.wheelR;
+
+  // wheels (they define the stance)
   const wheels: THREE.Group[] = [];
   const steerWheels: THREE.Group[] = [];
   const wheelPos: [number, number][] = [
@@ -276,14 +266,263 @@ export function buildCar(spec: CarSpec): BuiltCar {
   for (const [wx, wz] of wheelPos) {
     const steering = new THREE.Group();
     steering.position.set(wx, wheelR, wz);
-    const spin = buildWheel(spec, tireMat, rimMat, kit.trimMat);
+    const spin = buildWheel(spec, tireMat, rimMat);
     steering.add(spin);
     g.add(steering);
     wheels.push(spin);
     if (wz > 0) steerWheels.push(steering);
   }
 
-  addFlares(kit, g, spec);
+  // ── car-specific silhouettes ──
+  switch (spec.id) {
+    // Coastline — long roof, sleek tailgate: a Volvo V60-style wagon
+    case "sedan": {
+      const W = 1.86;
+      const bottom = 0.3;
+      const fz = spec.wheelBase;
+      const rz = -spec.wheelBase;
+
+      g.add(
+        extrudeProfile(
+          [
+            { p: [-2.3, bottom] },
+            { arch: { z: rz, y: wheelR, r: 0.47, bottom } },
+            { arch: { z: fz, y: wheelR, r: 0.47, bottom } },
+            { p: [2.34, bottom] },
+            { p: [2.46, 0.86] }, // raked nose face
+            { p: [2.2, 1.0] }, // hood lip
+            { p: [1.0, 1.04] }, // cowl
+            { p: [-2.1, 1.04] }, // beltline to the tailgate corner
+            { p: [-2.42, 0.95] }, // tailgate
+            { p: [-2.44, 0.6] },
+          ],
+          W,
+          kit.bodyMat
+        )
+      );
+
+      // glass canopy: windshield → long roof → raked tailgate glass
+      g.add(
+        extrudeProfile(
+          [
+            { p: [1.0, 1.04] },
+            { p: [0.44, 1.4] },
+            { p: [-1.52, 1.32] },
+            { p: [-2.1, 1.04] },
+          ],
+          W - 0.3,
+          kit.glassMat
+        )
+      );
+      // roof panel
+      box(g, W - 0.36, 0.06, 2.04, kit.roofMat, 0, 1.39, -0.54);
+      // roof rails
+      for (const sx of [-1, 1]) box(g, 0.05, 0.05, 1.6, kit.trimMat, sx * 0.55, 1.47, -0.55);
+
+      // face: headlights + a hint of Thor's-hammer ticks
+      for (const sx of [-1, 1]) {
+        box(g, 0.36, 0.07, 0.06, kit.lightMat, sx * 0.6, 0.72, 2.43, 0.21);
+        box(g, 0.07, 0.09, 0.06, kit.lightMat, sx * 0.6, 0.63, 2.41, 0.21);
+      }
+      box(g, 0.8, 0.2, 0.06, kit.trimMat, 0, 0.6, 2.4, 0.21);
+      // tail: vertical Volvo lamps
+      for (const sx of [-1, 1]) box(g, 0.08, 0.32, 0.05, kit.tailMat, sx * 0.58, 0.78, -2.43);
+      // mirrors
+      for (const sx of [-1, 1]) box(g, 0.1, 0.07, 0.14, kit.trimMat, sx * 0.97, 1.16, 0.78);
+      break;
+    }
+
+    // Highland — upright glasshouse, flat roof: a Lexus GX-style SUV
+    case "suv": {
+      const W = 2.0;
+      const bottom = 0.42;
+      const fz = spec.wheelBase;
+      const rz = -spec.wheelBase;
+
+      g.add(
+        extrudeProfile(
+          [
+            { p: [-2.4, bottom] },
+            { arch: { z: rz, y: wheelR, r: 0.55, bottom } },
+            { arch: { z: fz, y: wheelR, r: 0.55, bottom } },
+            { p: [2.3, bottom] },
+            { p: [2.46, 1.02] }, // tall upright nose
+            { p: [2.2, 1.1] }, // hood lip
+            { p: [0.62, 1.16] }, // cowl
+            { p: [-2.16, 1.18] }, // rising beltline
+            { p: [-2.42, 1.1] }, // upright tail
+            { p: [-2.44, 0.62] },
+          ],
+          W,
+          kit.bodyMat
+        )
+      );
+
+      // glass canopy: raked windshield → flat long roof → upright rear glass
+      g.add(
+        extrudeProfile(
+          [
+            { p: [0.62, 1.16] },
+            { p: [0.16, 1.66] },
+            { p: [-1.62, 1.66] },
+            { p: [-2.1, 1.2] },
+          ],
+          W - 0.32,
+          kit.glassMat
+        )
+      );
+      box(g, W - 0.38, 0.07, 1.86, kit.roofMat, 0, 1.7, -0.73);
+      for (const sx of [-1, 1]) box(g, 0.06, 0.06, 1.7, kit.trimMat, sx * 0.58, 1.78, -0.73);
+
+      // face: tall spindle grille + square lamps
+      box(g, 0.92, 0.34, 0.06, kit.trimMat, 0, 0.86, 2.38, 0.26);
+      for (const sx of [-1, 1]) box(g, 0.34, 0.12, 0.06, kit.lightMat, sx * 0.68, 1.0, 2.4, 0.26);
+      // tail: tall vertical lamps
+      for (const sx of [-1, 1]) box(g, 0.1, 0.36, 0.05, kit.tailMat, sx * 0.72, 0.86, -2.43);
+      // chunky side steps
+      for (const sx of [-1, 1]) box(g, 0.16, 0.09, 1.9, kit.trimMat, sx * 0.94, 0.36, -0.1);
+      // mirrors
+      for (const sx of [-1, 1]) box(g, 0.12, 0.08, 0.14, kit.trimMat, sx * 1.06, 1.3, 0.55);
+      break;
+    }
+
+    // Mesa — stubby EV nose, bed with sail pillars: a Rivian R1T-style pickup
+    case "truck": {
+      const W = 2.02;
+      const bottom = 0.44;
+      const fz = spec.wheelBase;
+      const rz = -spec.wheelBase;
+
+      g.add(
+        extrudeProfile(
+          [
+            { p: [-2.5, bottom] },
+            { arch: { z: rz, y: wheelR, r: 0.56, bottom } },
+            { arch: { z: fz, y: wheelR, r: 0.56, bottom } },
+            { p: [2.24, bottom] },
+            { p: [2.44, 0.92] }, // rounded EV nose
+            { p: [1.9, 1.04] }, // hood
+            { p: [0.85, 1.1] }, // cowl
+            { p: [-2.3, 1.1] }, // bed rail
+            { p: [-2.48, 1.02] }, // tailgate
+            { p: [-2.5, 0.6] },
+          ],
+          W,
+          kit.bodyMat
+        )
+      );
+
+      // cab canopy: EV cab with vertical rear glass
+      g.add(
+        extrudeProfile(
+          [
+            { p: [0.85, 1.1] },
+            { p: [0.38, 1.52] },
+            { p: [-0.52, 1.52] },
+            { p: [-0.7, 1.12] },
+          ],
+          W - 0.32,
+          kit.glassMat
+        )
+      );
+      box(g, W - 0.38, 0.07, 1.0, kit.roofMat, 0, 1.56, -0.07);
+      // sail pillars linking the cab to the bed rails
+      for (const sx of [-1, 1]) {
+        box(g, 0.12, 0.44, 0.34, kit.bodyMat, sx * 0.72, 1.32, -0.9, -0.4);
+      }
+      // tonneau bed + rail caps
+      box(g, 1.58, 0.05, 1.66, kit.trimMat, 0, 1.12, -1.6);
+      for (const sx of [-1, 1]) box(g, 0.12, 0.05, 1.72, kit.accentMat, sx * 0.86, 1.13, -1.56);
+
+      // face: stadium headlights (no grille — it's electric)
+      for (const sx of [-1, 1]) {
+        const pillGeo = new THREE.CylinderGeometry(0.055, 0.055, 0.22, 8);
+        pillGeo.rotateZ(Math.PI / 2);
+        const pill = new THREE.Mesh(pillGeo, kit.lightMat);
+        pill.position.set(sx * 0.6, 0.76, 2.36);
+        pill.rotation.x = 0.4;
+        pill.castShadow = true;
+        g.add(pill);
+      }
+      box(g, 1.96, 0.16, 0.14, kit.trimMat, 0, 0.46, 2.28); // front bumper
+      // full-width tail light bar
+      box(g, 1.7, 0.06, 0.05, kit.tailMat, 0, 1.02, -2.5);
+      box(g, 1.96, 0.16, 0.14, kit.trimMat, 0, 0.46, -2.42); // rear bumper
+      // mirrors
+      for (const sx of [-1, 1]) box(g, 0.12, 0.08, 0.14, kit.trimMat, sx * 1.06, 1.32, 0.62);
+      break;
+    }
+
+    // Blossom — fender crests, set-back canopy, fastback: a 911-style coupe
+    case "sport": {
+      const W = 1.92;
+      const bottom = 0.22;
+      const fz = spec.wheelBase;
+      const rz = -spec.wheelBase;
+
+      g.add(
+        extrudeProfile(
+          [
+            { p: [-2.16, bottom] },
+            { arch: { z: rz, y: wheelR, r: 0.45, bottom } },
+            { arch: { z: fz, y: wheelR, r: 0.45, bottom } },
+            { p: [2.08, bottom] },
+            { p: [2.2, 0.5] }, // soft nose
+            { p: [1.98, 0.74] }, // front fender crest
+            { p: [1.05, 0.66] }, // hood dip
+            { p: [0.6, 0.8] }, // cowl
+            { p: [0.0, 0.74] }, // low mid-body
+            { p: [-1.55, 0.88] }, // rear haunch
+            { p: [-2.05, 0.94] }, // ducktail
+            { p: [-2.18, 0.62] },
+          ],
+          W,
+          kit.bodyMat
+        )
+      );
+
+      // glass canopy: steep windshield → flyline roof → long fastback glass
+      g.add(
+        extrudeProfile(
+          [
+            { p: [0.6, 0.8] },
+            { p: [0.1, 1.16] },
+            { p: [-0.65, 1.12] },
+            { p: [-1.8, 0.9] },
+            { p: [-1.0, 0.79] },
+            { p: [0.0, 0.74] },
+          ],
+          W - 0.4,
+          kit.glassMat
+        )
+      );
+      box(g, 1.46, 0.06, 0.8, kit.roofMat, 0, 1.17, -0.28);
+
+      // round headlight discs on the fenders
+      for (const sx of [-1, 1]) {
+        const lampGeo = new THREE.CylinderGeometry(0.09, 0.09, 0.07, 10);
+        lampGeo.rotateX(Math.PI / 2);
+        const lamp = new THREE.Mesh(lampGeo, kit.lightMat);
+        lamp.position.set(sx * 0.6, 0.66, 1.96);
+        lamp.rotation.x = 0.46;
+        lamp.castShadow = true;
+        g.add(lamp);
+      }
+      // full-width tail light bar on the ducktail
+      box(g, 1.34, 0.05, 0.05, kit.tailMat, 0, 0.86, -2.14);
+      // twin exhausts
+      for (const sx of [-1, 1]) {
+        const exGeo = new THREE.CylinderGeometry(0.045, 0.045, 0.12, 8);
+        exGeo.rotateX(Math.PI / 2);
+        const ex = new THREE.Mesh(exGeo, kit.trimMat);
+        ex.position.set(sx * 0.18, 0.29, -2.12);
+        g.add(ex);
+      }
+      // mirrors
+      for (const sx of [-1, 1]) box(g, 0.09, 0.06, 0.12, kit.trimMat, sx * 1.0, 0.94, 0.52);
+      break;
+    }
+  }
 
   // soft contact shadow — a radial blob at the wheel-contact plane that
   // visually anchors the car to the ground in the stylized art
@@ -308,152 +547,6 @@ export function buildCar(spec: CarSpec): BuiltCar {
   shadowBlob.position.y = 0.03;
   shadowBlob.renderOrder = 1;
   g.add(shadowBlob);
-
-  // ── car-specific silhouettes ──
-  let noseZ: number;
-  let tailZ: number;
-
-  switch (spec.id) {
-    case "sedan": {
-      const L = 4.5, W = 1.86;
-      noseZ = 2.32; tailZ = -2.3;
-      add(g, rbox(W, 0.58, L, 0.2), kit.bodyMat, 0, groundY + 0.29, 0);
-      add(g, rbox(W - 0.08, 0.16, L - 0.5, 0.07), kit.bodyMat, 0, groundY + 0.66, 0);
-      // greenhouse
-      add(g, rbox(1.58, 0.4, 1.95, 0.09), kit.glassMat, 0, groundY + 0.94, -0.1);
-      // slanted windshield + rear glass
-      add(g, rbox(1.5, 0.56, 0.09, 0.04), kit.glassMat, 0, groundY + 1.02, 0.86, 0.42);
-      add(g, rbox(1.5, 0.5, 0.09, 0.04), kit.glassMat, 0, groundY + 1.0, -1.05, -0.5);
-      // side glass
-      for (const sx of [-0.8, 0.8]) add(g, rbox(0.05, 0.32, 1.7, 0.02), kit.glassMat, sx, groundY + 0.95, -0.1);
-      // roof
-      add(g, rbox(1.48, 0.09, 1.85, 0.045), kit.roofMat, 0, groundY + 1.16, -0.12);
-      // shark-fin antenna
-      add(g, rbox(0.09, 0.12, 0.24, 0.03), kit.trimMat, 0, groundY + 1.27, -0.9);
-      // mirrors
-      addMirrors(kit, g, 0.86, groundY + 1.02, 0.62);
-      // grille + chrome strip + bumpers
-      add(g, rbox(1.06, 0.15, 0.08, 0.03), kit.trimMat, 0, groundY + 0.47, noseZ - 0.02);
-      add(g, rbox(1.2, 0.05, 0.08, 0.02), kit.chromeMat, 0, groundY + 0.36, noseZ);
-      add(g, rbox(W + 0.02, 0.2, 0.32, 0.07), kit.accentMat, 0, groundY + 0.12, noseZ - 0.12);
-      add(g, rbox(W + 0.02, 0.2, 0.28, 0.07), kit.accentMat, 0, groundY + 0.12, tailZ + 0.1);
-      // lights
-      for (const sx of [-0.62, 0.62]) add(g, rbox(0.4, 0.12, 0.08, 0.03), kit.lightMat, sx, groundY + 0.62, noseZ);
-      add(g, rbox(1.32, 0.08, 0.05, 0.02), kit.tailMat, 0, groundY + 0.66, tailZ);
-      addExhausts(kit, g, spec, tailZ, 1);
-      break;
-    }
-    case "suv": {
-      const L = 4.7, W = 1.94;
-      noseZ = 2.42; tailZ = -2.42;
-      add(g, rbox(W, 0.78, L, 0.16), kit.bodyMat, 0, groundY + 0.39, 0);
-      // beltline accent
-      add(g, rbox(W + 0.02, 0.1, L - 0.4, 0.04), kit.accentMat, 0, groundY + 0.78, 0);
-      // greenhouse
-      add(g, rbox(1.72, 0.52, 2.8, 0.1), kit.glassMat, 0, groundY + 1.28, -0.32);
-      add(g, rbox(1.66, 0.55, 0.09, 0.04), kit.glassMat, 0, groundY + 1.36, 1.06, 0.32);
-      for (const sx of [-0.87, 0.87]) add(g, rbox(0.05, 0.42, 2.55, 0.02), kit.glassMat, sx, groundY + 1.28, -0.32);
-      add(g, rbox(1.64, 0.09, 2.6, 0.04), kit.roofMat, 0, groundY + 1.56, -0.36);
-      // roof rails
-      for (const sx of [-0.6, 0.6]) add(g, rbox(0.09, 0.08, 2.15, 0.03), kit.trimMat, sx, groundY + 1.66, -0.36);
-      // rear roof spoiler
-      add(g, rbox(1.55, 0.08, 0.3, 0.03), kit.trimMat, 0, groundY + 1.6, -1.7);
-      // mirrors
-      addMirrors(kit, g, 0.94, groundY + 1.3, 0.8);
-      // side steps
-      for (const sx of [-1, 1]) add(g, rbox(0.2, 0.08, 2.3, 0.03), kit.trimMat, sx * (spec.track + 0.16), groundY - 0.28, -0.2);
-      // skid plate + bumpers
-      add(g, rbox(1.0, 0.22, 0.1, 0.04), kit.accentMat, 0, groundY + 0.14, noseZ);
-      add(g, rbox(W + 0.04, 0.24, 0.32, 0.08), kit.accentMat, 0, groundY + 0.12, noseZ - 0.14);
-      add(g, rbox(W + 0.04, 0.24, 0.3, 0.08), kit.accentMat, 0, groundY + 0.12, tailZ + 0.12);
-      // lights + fog lights
-      for (const sx of [-0.66, 0.66]) add(g, rbox(0.42, 0.13, 0.08, 0.03), kit.lightMat, sx, groundY + 0.72, noseZ);
-      for (const sx of [-0.75, 0.75]) add(g, rbox(0.18, 0.12, 0.06, 0.02), kit.lightMat, sx, groundY + 0.2, noseZ - 0.05);
-      add(g, rbox(1.4, 0.1, 0.05, 0.02), kit.tailMat, 0, groundY + 0.76, tailZ);
-      // rear-mounted spare wheel
-      const spare = new THREE.Mesh(new THREE.CylinderGeometry(0.38, 0.38, 0.2, 18), tireMat);
-      spare.rotation.x = Math.PI / 2;
-      spare.position.set(0, groundY + 0.5, tailZ - 0.1);
-      spare.castShadow = true;
-      g.add(spare);
-      add(g, new THREE.CylinderGeometry(0.16, 0.16, 0.24, 12).rotateX(Math.PI / 2), kit.chromeMat, 0, groundY + 0.5, tailZ - 0.1);
-      addExhausts(kit, g, spec, tailZ, 1);
-      break;
-    }
-    case "truck": {
-      const L = 5.1, W = 2.0;
-      noseZ = 2.05; tailZ = -2.62;
-      const cabZ = 0.9;
-      // cab
-      add(g, rbox(W, 0.72, 1.9, 0.14), kit.bodyMat, 0, groundY + 0.36, cabZ);
-      add(g, rbox(W - 0.1, 0.48, 1.72, 0.09), kit.glassMat, 0, groundY + 0.96, cabZ);
-      add(g, rbox(1.62, 0.5, 0.09, 0.04), kit.glassMat, 0, groundY + 0.98, cabZ + 0.86, 0.28);
-      add(g, rbox(W - 0.16, 0.1, 1.6, 0.045), kit.roofMat, 0, groundY + 1.24, cabZ);
-      for (const sx of [-0.88, 0.88]) add(g, rbox(0.05, 0.36, 1.6, 0.02), kit.glassMat, sx, groundY + 0.96, cabZ);
-      // roof light bar
-      add(g, rbox(1.3, 0.1, 0.16, 0.04), kit.trimMat, 0, groundY + 1.33, cabZ + 0.3);
-      for (const sx of [-0.4, 0, 0.4]) add(g, rbox(0.14, 0.09, 0.1, 0.02), kit.lightMat, sx, groundY + 1.33, cabZ + 0.36);
-      // mirrors (tall truck style)
-      addMirrors(kit, g, 0.96, groundY + 1.06, cabZ + 0.8);
-      // bed
-      add(g, rbox(W, 0.4, 2.6, 0.08), kit.bodyMat, 0, groundY + 0.2, -1.3);
-      add(g, rbox(W - 0.4, 0.12, 2.3, 0.04), kit.trimMat, 0, groundY + 0.44, -1.3);
-      for (const sx of [-0.84, 0.84]) {
-        add(g, rbox(0.18, 0.5, 2.6, 0.06), kit.bodyMat, sx, groundY + 0.6, -1.3);
-        // bed rails
-        add(g, rbox(0.1, 0.08, 2.3, 0.03), kit.chromeMat, sx, groundY + 0.92, -1.3);
-      }
-      add(g, rbox(W, 0.5, 0.18, 0.06), kit.bodyMat, 0, groundY + 0.6, -2.6);
-      // big chrome grille + heavy bumpers
-      add(g, rbox(1.5, 0.34, 0.09, 0.04), kit.chromeMat, 0, groundY + 0.44, noseZ);
-      add(g, rbox(1.3, 0.24, 0.06, 0.02), kit.trimMat, 0, groundY + 0.44, noseZ - 0.03);
-      add(g, rbox(W + 0.08, 0.28, 0.34, 0.09), kit.trimMat, 0, groundY + 0.12, noseZ - 0.12);
-      add(g, rbox(W + 0.08, 0.28, 0.3, 0.09), kit.trimMat, 0, groundY + 0.12, tailZ + 0.1);
-      // lights + vertical taillights
-      for (const sx of [-0.72, 0.72]) add(g, rbox(0.34, 0.15, 0.08, 0.03), kit.lightMat, sx, groundY + 0.78, noseZ);
-      for (const sx of [-0.86, 0.86]) add(g, rbox(0.12, 0.4, 0.08, 0.03), kit.tailMat, sx, groundY + 0.68, tailZ);
-      addExhausts(kit, g, spec, tailZ, 1);
-      break;
-    }
-    case "sport": {
-      const L = 4.55, W = 1.96;
-      noseZ = 2.3; tailZ = -2.28;
-      const bodyH = 0.46;
-      add(g, rbox(W, bodyH, L, 0.18), kit.bodyMat, 0, groundY + bodyH / 2, 0);
-      // wedge hood: stepped stack, slightly narrower each time
-      add(g, rbox(W - 0.06, 0.12, L - 1.1, 0.07), kit.bodyMat, 0, groundY + bodyH + 0.05, 0.5);
-      add(g, rbox(W - 0.16, 0.1, L - 1.6, 0.06), kit.bodyMat, 0, groundY + bodyH + 0.15, 0.55);
-      // teardrop canopy set far back
-      add(g, rbox(1.44, 0.4, 1.6, 0.11), kit.glassMat, 0, groundY + bodyH + 0.26, -0.5);
-      add(g, rbox(1.4, 0.52, 0.09, 0.04), kit.glassMat, 0, groundY + bodyH + 0.28, 0.25, 0.55);
-      // fastback rear glass
-      add(g, rbox(1.36, 0.5, 0.09, 0.04), kit.glassMat, 0, groundY + bodyH + 0.24, -1.25, -0.6);
-      add(g, rbox(1.22, 0.08, 1.0, 0.04), kit.roofMat, 0, groundY + bodyH + 0.48, -0.6);
-      for (const sx of [-0.74, 0.74]) add(g, rbox(0.05, 0.3, 1.35, 0.02), kit.glassMat, sx, groundY + bodyH + 0.24, -0.5);
-      // mirrors
-      addMirrors(kit, g, 0.94, groundY + bodyH + 0.3, 0.42);
-      // side skirts
-      for (const sx of [-1, 1]) add(g, rbox(0.12, 0.1, 2.0, 0.03), kit.trimMat, sx * (spec.track + 0.18), groundY + 0.06, -0.1);
-      // front splitter
-      add(g, rbox(W - 0.1, 0.08, 0.4, 0.03), kit.trimMat, 0, groundY + 0.02, noseZ - 0.16);
-      // grille opening + sculpted bumpers
-      add(g, rbox(1.0, 0.16, 0.08, 0.03), kit.trimMat, 0, groundY + 0.22, noseZ);
-      add(g, rbox(W + 0.02, 0.16, 0.28, 0.06), kit.accentMat, 0, groundY + 0.16, noseZ - 0.1);
-      // rear diffuser hint
-      add(g, rbox(W - 0.2, 0.14, 0.3, 0.04), kit.trimMat, 0, groundY + 0.06, tailZ + 0.08);
-      // wing with endplates
-      add(g, rbox(1.5, 0.06, 0.32, 0.03), kit.accentMat, 0, groundY + bodyH + 0.38, -2.05);
-      for (const sx of [-0.68, 0.68]) {
-        add(g, rbox(0.08, 0.26, 0.12, 0.03), kit.trimMat, sx, groundY + bodyH + 0.2, -2.02);
-        add(g, rbox(0.06, 0.2, 0.34, 0.03), kit.roofMat, sx, groundY + bodyH + 0.42, -2.05);
-      }
-      // sleek lights
-      for (const sx of [-0.62, 0.62]) add(g, rbox(0.44, 0.09, 0.08, 0.03), kit.lightMat, sx, groundY + 0.34, noseZ);
-      add(g, rbox(1.5, 0.07, 0.05, 0.02), kit.tailMat, 0, groundY + 0.42, tailZ);
-      addExhausts(kit, g, spec, tailZ, 2);
-      break;
-    }
-  }
 
   return { group: g, wheels, steerWheels };
 }
