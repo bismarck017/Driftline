@@ -225,9 +225,6 @@ export function GameClient() {
                 winding roads. Pick a car, then just drive.
               </p>
             </div>
-            <span className="hidden rounded-full border border-stone-300/70 bg-white/50 px-4 py-1.5 text-xs font-medium text-stone-500 sm:block">
-              Infinite tile-streamed terrain · roads never break
-            </span>
           </header>
 
           <main className="mt-8 grid flex-1 grid-cols-1 gap-6 lg:grid-cols-[1.15fr_1fr]">
@@ -240,7 +237,6 @@ export function GameClient() {
               <div className="absolute bottom-5 right-5 z-10 flex items-center gap-2 text-[11px] text-stone-500">
                 <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: selectedCar.body }} />
                 <span className="font-medium">{selectedCar.body.toUpperCase()}</span>
-                <span className="text-stone-400">· hand-built low-poly</span>
               </div>
               <CarPreview spec={selectedCar} className="h-[340px] w-full sm:h-[420px]" />
             </section>
@@ -304,9 +300,6 @@ export function GameClient() {
                 >
                   Drive the {selectedCar.name}
                 </Button>
-                <p className="mt-3 text-center text-[11px] text-stone-400">
-                  Keyboard recommended — <KeyCap>W A S D</KeyCap> to drive, <KeyCap>Esc</KeyCap> to pause
-                </p>
               </div>
             </section>
           </main>
