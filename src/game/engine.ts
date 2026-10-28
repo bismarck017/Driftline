@@ -51,6 +51,11 @@ const BIOME_LABEL: Record<string, string> = {
   snow: "Snowfield",
 };
 
+// tire FX budgets: marks live in one ring-buffered ribbon geometry (a single
+// draw call), smoke in a fixed pool of soft sprites that get recycled.
+const SKID_MAX = 700; // quads (~55 m of continuous twin marks)
+const SMOKE_MAX = 48;
+
 // ── Day-night environment ─────────────────────────────────────────────────────
 // Keyframed pastel palettes over 24h: deep night -> dawn rose -> morning mist ->
 // bright pastel noon -> golden hour -> peach sunset -> violet twilight -> night.
@@ -206,6 +211,21 @@ export class DriveGame {
   private throttleIn = false;
   private revBlend = 0; // 0 = chase cam behind, 1 = reverse cam ahead
 
+  // skid marks & tire smoke
+  private skidGeo!: THREE.BufferGeometry;
+  private skidMat!: THREE.MeshBasicMaterial;
+  private skidPos!: THREE.BufferAttribute;
+  private skidCol!: THREE.BufferAttribute;
+  private skidAlpha = new Float32Array(SKID_MAX); // per-quad fade alpha
+  private skidHead = 0; // ring-buffer write cursor
+  private skidLive = 0; // quads still fading
+  private skidLastL: THREE.Vector3 | null = null; // previous rear-left contact
+  private skidLastR: THREE.Vector3 | null = null; // previous rear-right contact
+  private smokeTex!: THREE.CanvasTexture;
+  private smoke: THREE.Sprite[] = [];
+  private smokeAcc = 0; // puff-rate accumulator
+  private wasLocked = false; // for the lockup smoke burst
+
   // day-night state
   private todHours = 10; // in-world hour [0, 24)
   private cycleEnabled = true;
@@ -339,6 +359,9 @@ export class DriveGame {
 
     // ── water time uniform + tiles ──
     this.tiles = new TileManager(this.scene, opts.renderRadius, { time: this.waterTime, tint: this.waterTint });
+
+    // ── skid marks + tire smoke ──
+    this.initTireFX();
 
     // ── the player's car ──
     this.built = buildCar(car);
@@ -487,6 +510,10 @@ export class DriveGame {
       if (m) m.dispose();
     });
     this.tiles.disposeAll();
+    this.skidGeo.dispose();
+    this.skidMat.dispose();
+    this.smokeTex.dispose();
+    for (const s of this.smoke) (s.material as THREE.SpriteMaterial).dispose();
     this.sky.geometry.dispose();
     (this.sky.material as THREE.Material).dispose();
     this.renderer.dispose();
@@ -545,6 +572,8 @@ export class DriveGame {
     this.heading = spawn.heading;
     this.speed = 0;
     this.smoothY = this.pos.y;
+    this.skidLastL = null;
+    this.skidLastR = null; // no streaks across the teleport
   }
 
   // ── physics ────────────────────────────────────────────────────────────────
@@ -603,7 +632,7 @@ export class DriveGame {
       this.lockProg = Math.max(0, this.lockProg - 3 * dt);
     }
     this.locked = this.lockProg >= 1 && this.speed > 4;
-    if (handbrake) this.speed -= Math.sign(this.speed) * 14 * dt;
+    if (handbrake) this.speed -= Math.sign(this.speed) * 6.5 * dt;
 
     // drag & rolling resistance
     const drag = onRoad ? 0.06 : 0.16;
@@ -710,6 +739,221 @@ export class DriveGame {
     this.built.wheels.forEach((w) => {
       w.rotation.x = -this.wheelSpin;
     });
+
+    // skid marks + smoke (needs the post-integration position)
+    this.updateTireFX(dt, handbrake);
+  }
+
+  // ── tire FX: skid marks + smoke ─────────────────────────────────────────────
+
+  /** One dynamic ribbon geometry + a pool of soft sprites. Marks follow the
+   *  rear-axle contact points whenever the tires are sliding — brake lockup or
+   *  a yanked handbrake at speed — and slowly fade back to nothing. */
+  private initTireFX() {
+    this.skidGeo = new THREE.BufferGeometry();
+    this.skidPos = new THREE.BufferAttribute(new Float32Array(SKID_MAX * 6 * 3), 3);
+    this.skidCol = new THREE.BufferAttribute(new Float32Array(SKID_MAX * 6 * 4), 4);
+    this.skidPos.setUsage(THREE.DynamicDrawUsage);
+    this.skidCol.setUsage(THREE.DynamicDrawUsage);
+    this.skidGeo.setAttribute("position", this.skidPos);
+    this.skidGeo.setAttribute("color", this.skidCol);
+    this.skidMat = new THREE.MeshBasicMaterial({
+      vertexColors: true, // itemSize-4 colors give per-vertex alpha
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -4,
+    });
+    const marks = new THREE.Mesh(this.skidGeo, this.skidMat);
+    marks.frustumCulled = false; // world-spanning ring buffer
+    marks.renderOrder = 2; // above the contact-shadow blob
+    this.scene.add(marks);
+
+    // soft radial puff texture, shared by every sprite — a touch darker than
+    // the pale road so it reads as rubber haze, not glare
+    const c = document.createElement("canvas");
+    c.width = c.height = 64;
+    const g = c.getContext("2d")!;
+    const grad = g.createRadialGradient(32, 32, 2, 32, 32, 30);
+    grad.addColorStop(0, "rgba(222,222,229,0.95)");
+    grad.addColorStop(0.55, "rgba(205,205,214,0.45)");
+    grad.addColorStop(1, "rgba(205,205,214,0)");
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 64, 64);
+    this.smokeTex = new THREE.CanvasTexture(c);
+    for (let i = 0; i < SMOKE_MAX; i++) {
+      const s = new THREE.Sprite(
+        new THREE.SpriteMaterial({ map: this.smokeTex, transparent: true, depthWrite: false, opacity: 0 }),
+      );
+      s.visible = false;
+      this.scene.add(s);
+      this.smoke.push(s);
+    }
+  }
+
+  private updateTireFX(dt: number, handbrake: boolean) {
+    const sliding = this.locked || (handbrake && Math.abs(this.speed) > 8);
+    // tires start steaming under threshold braking too, just before they lock
+    const smoking = sliding || (this.lockProg > 0.55 && this.speed > 9);
+    const dirX = Math.sin(this.heading);
+    const dirZ = Math.cos(this.heading);
+    const halfW = this.car.wheelW * 0.7;
+
+    const rearWheel = (side: number): [number, number] => [
+      this.pos.x + side * this.car.track * dirZ - dirX * this.car.wheelBase,
+      this.pos.z - side * this.car.track * dirX - dirZ * this.car.wheelBase,
+    ];
+
+    if (sliding) {
+      for (let side = -1; side <= 1; side += 2) {
+        // rear-axle contact point (right vector = (dirZ, -dirX))
+        const [wx, wz] = rearWheel(side);
+        const last = side < 0 ? this.skidLastL : this.skidLastR;
+        if (!last) {
+          const seed = new THREE.Vector3(wx, 0, wz);
+          if (side < 0) this.skidLastL = seed;
+          else this.skidLastR = seed;
+          continue;
+        }
+        const d = Math.hypot(wx - last.x, wz - last.z);
+        if (d >= 0.14 && d < 4) this.pushSkid(last.x, last.z, wx, wz, halfW);
+        if (d >= 0.14) {
+          last.x = wx;
+          last.z = wz;
+        }
+      }
+    } else {
+      // clean break — the next slide starts a fresh ribbon
+      this.skidLastL = null;
+      this.skidLastR = null;
+    }
+
+    if (smoking) {
+      // fresh lockup? an instant double puff per wheel sells the moment
+      if (this.locked && !this.wasLocked) {
+        for (let side = -1; side <= 1; side += 2) {
+          const [wx, wz] = rearWheel(side);
+          this.spawnSmoke(wx, surfaceHeightAt(wx, wz) + 0.12, wz, dirX, dirZ);
+          this.spawnSmoke(wx, surfaceHeightAt(wx, wz) + 0.12, wz, dirX, dirZ);
+        }
+      }
+      // puffs spawn faster the harder the slide (and lockup smokes most)
+      this.smokeAcc += dt * Math.abs(this.speed) * (this.locked ? 0.7 : 0.3);
+      if (this.smokeAcc >= 1) {
+        this.smokeAcc = 0;
+        for (let side = -1; side <= 1; side += 2) {
+          const [wx, wz] = rearWheel(side);
+          this.spawnSmoke(wx, surfaceHeightAt(wx, wz) + 0.12, wz, dirX, dirZ);
+        }
+      }
+    } else {
+      this.smokeAcc = 0;
+    }
+    this.wasLocked = this.locked;
+
+    this.fadeSkids(dt);
+    this.updateSmoke(dt);
+  }
+
+  /** Append one ribbon quad between the previous and current contact points. */
+  private pushSkid(p0x: number, p0z: number, p1x: number, p1z: number, halfW: number) {
+    let dx = p1x - p0x;
+    let dz = p1z - p0z;
+    const len = Math.hypot(dx, dz);
+    if (len < 1e-4) return;
+    dx /= len;
+    dz /= len;
+    const px = -dz * halfW;
+    const pz = dx * halfW;
+
+    const i = this.skidHead;
+    this.skidHead = (this.skidHead + 1) % SKID_MAX;
+    const P = this.skidPos.array as Float32Array;
+    const C = this.skidCol.array as Float32Array;
+    const base = i * 6;
+    const yA = surfaceHeightAt(p0x + px, p0z + pz) + 0.04;
+    const yB = surfaceHeightAt(p0x - px, p0z - pz) + 0.04;
+    const yC = surfaceHeightAt(p1x + px, p1z + pz) + 0.04;
+    const yD = surfaceHeightAt(p1x - px, p1z - pz) + 0.04;
+    const set = (v: number, x: number, y: number, z: number) => {
+      P[v * 3] = x;
+      P[v * 3 + 1] = y;
+      P[v * 3 + 2] = z;
+    };
+    // two triangles: A-B-C, B-D-C (double-sided, so winding is cosmetic)
+    set(base, p0x + px, yA, p0z + pz);
+    set(base + 1, p0x - px, yB, p0z - pz);
+    set(base + 2, p1x + px, yC, p1z + pz);
+    set(base + 3, p0x - px, yB, p0z - pz);
+    set(base + 4, p1x - px, yD, p1z - pz);
+    set(base + 5, p1x + px, yC, p1z + pz);
+
+    this.skidAlpha[i] = 0.55;
+    for (let v = 0; v < 6; v++) {
+      const c = (base + v) * 4;
+      C[c] = 0.14;
+      C[c + 1] = 0.13;
+      C[c + 2] = 0.12;
+      C[c + 3] = 0.55;
+    }
+    this.skidPos.needsUpdate = true;
+    this.skidCol.needsUpdate = true;
+    if (this.skidLive < SKID_MAX) this.skidLive++;
+  }
+
+  /** Ease every live quad's alpha toward zero (~16 s from full). */
+  private fadeSkids(dt: number) {
+    if (this.skidLive <= 0) return;
+    const C = this.skidCol.array as Float32Array;
+    const decay = dt * 0.035;
+    let live = 0;
+    for (let i = 0; i < SKID_MAX; i++) {
+      let a = this.skidAlpha[i];
+      if (a <= 0) continue;
+      a = Math.max(0, a - decay);
+      this.skidAlpha[i] = a;
+      for (let v = 0; v < 6; v++) C[(i * 6 + v) * 4 + 3] = a;
+      if (a > 0) live++;
+    }
+    this.skidLive = live;
+    this.skidCol.needsUpdate = true;
+  }
+
+  private spawnSmoke(x: number, y: number, z: number, dirX: number, dirZ: number) {
+    const s = this.smoke.find((p) => !p.visible);
+    if (!s) return; // pool exhausted — skip this puff
+    const u = s.userData as { age: number; life: number; base: number; vx: number; vy: number; vz: number };
+    u.age = 0;
+    u.life = 0.7 + Math.random() * 0.5;
+    u.base = 0.7 + Math.random() * 0.4;
+    u.vx = dirX * this.speed * 0.3 + (Math.random() - 0.5) * 0.6;
+    u.vy = 0.8 + Math.random() * 0.7;
+    u.vz = dirZ * this.speed * 0.3 + (Math.random() - 0.5) * 0.6;
+    s.position.set(x + (Math.random() - 0.5) * 0.4, y, z + (Math.random() - 0.5) * 0.4);
+    s.scale.set(u.base, u.base, 1);
+    (s.material as THREE.SpriteMaterial).opacity = 0.6;
+    s.visible = true;
+  }
+
+  private updateSmoke(dt: number) {
+    for (const s of this.smoke) {
+      if (!s.visible) continue;
+      const u = s.userData as { age: number; life: number; base: number; vx: number; vy: number; vz: number };
+      u.age += dt;
+      const t = u.age / u.life;
+      if (t >= 1) {
+        s.visible = false;
+        continue;
+      }
+      const g = u.base * (1 + t * 2.2); // puffs balloon as they dissipate
+      s.scale.set(g, g, 1);
+      s.position.x += u.vx * dt;
+      s.position.y += u.vy * dt;
+      s.position.z += u.vz * dt;
+      (s.material as THREE.SpriteMaterial).opacity = 0.6 * (1 - t);
+    }
   }
 
   // ── camera ─────────────────────────────────────────────────────────────────

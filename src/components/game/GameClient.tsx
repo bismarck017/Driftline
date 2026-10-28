@@ -342,25 +342,26 @@ export function GameClient() {
 
       {!loading && stats && (
         <>
-          {/* speed panel — click to switch km/h ⇄ mph */}
+          {/* speed panel — bottom right, height-matched to the gauge cluster.
+              click to switch km/h ⇄ mph */}
           <button
             onClick={toggleUnit}
             aria-label={`Speed in ${unit === "kmh" ? "kilometres per hour" : "miles per hour"}. Click to switch units.`}
-            className="absolute bottom-6 left-1/2 z-10 flex -translate-x-1/2 cursor-pointer select-none items-end gap-3 rounded-3xl bg-white/70 px-6 py-4 text-left shadow-xl shadow-stone-900/10 backdrop-blur-md transition-all hover:bg-white/85 active:scale-[0.97]"
+            className="absolute bottom-5 right-5 z-10 flex h-[88px] min-w-[148px] cursor-pointer select-none flex-col items-end justify-center gap-1.5 rounded-2xl bg-white/70 px-6 shadow-lg shadow-stone-900/10 backdrop-blur-md transition-all hover:bg-white/85 active:scale-[0.97]"
           >
-            <span className="text-5xl font-bold tabular-nums leading-none text-stone-800">
+            <span className="text-4xl font-bold tabular-nums leading-none text-stone-800">
               {unit === "kmh" ? stats.kmh : Math.round(stats.kmh * 0.621371)}
             </span>
-            <span className="flex flex-col gap-0.5 pb-1">
-              <span className="text-xs font-semibold uppercase tracking-widest text-stone-500">
+            <span className="flex items-baseline gap-1.5">
+              <span className="text-[10px] font-semibold uppercase tracking-widest text-stone-500">
                 {unit === "kmh" ? "km/h" : "mph"}
               </span>
-              <span className="text-[9px] leading-none text-stone-400">tap to switch</span>
+              <span className="text-[9px] font-medium text-stone-400">tap to switch</span>
             </span>
           </button>
 
-          {/* gauge cluster — gear, revs, clock, odometer */}
-          <div className="pointer-events-none absolute bottom-5 left-5 z-10 rounded-2xl bg-white/70 px-5 py-3 shadow-lg shadow-stone-900/10 backdrop-blur-md">
+          {/* gauge cluster — gear, revs, clock, odometer (bottom left) */}
+          <div className="pointer-events-none absolute bottom-5 left-5 z-10 flex h-[88px] flex-col justify-center rounded-2xl bg-white/70 px-5 shadow-lg shadow-stone-900/10 backdrop-blur-md">
             <div className="flex items-center gap-4">
               <div className="flex w-9 flex-col items-center rounded-xl bg-stone-800/90 px-1.5 py-1.5">
                 <span className="text-xl font-bold leading-none tabular-nums text-[#f6efe2]">
