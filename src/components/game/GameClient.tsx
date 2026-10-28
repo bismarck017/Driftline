@@ -363,11 +363,10 @@ export function GameClient() {
           {/* gauge cluster — gear, revs, clock, odometer (bottom left) */}
           <div className="pointer-events-none absolute bottom-5 left-5 z-10 flex h-[88px] flex-col justify-center rounded-2xl bg-white/70 px-5 shadow-lg shadow-stone-900/10 backdrop-blur-md">
             <div className="flex items-center gap-4">
-              <div className="flex w-9 flex-col items-center rounded-xl bg-stone-800/90 px-1.5 py-1.5">
+              <div className="flex w-9 flex-col items-center justify-center rounded-xl bg-stone-800/90 px-1.5 py-1.5">
                 <span className="text-xl font-bold leading-none tabular-nums text-[#f6efe2]">
                   {stats.gear === -1 ? "R" : stats.gear === 0 ? "N" : stats.gear}
                 </span>
-                <span className="text-[8px] font-semibold uppercase tracking-widest text-[#f6efe2]/60">gear</span>
               </div>
               <div className="flex flex-col gap-1.5">
                 <div className="relative h-2.5 w-40 overflow-hidden rounded-full bg-stone-900/10">
@@ -392,11 +391,6 @@ export function GameClient() {
             </div>
             <div className="mt-1.5 flex items-center gap-2 text-[11px]">
               <span className="font-medium text-stone-500">{stats.biome}</span>
-              {stats.locked && (
-                <span className="rounded-md bg-[#e26d6d]/20 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-[#c2413d]">
-                  wheel lock
-                </span>
-              )}
             </div>
           </div>
 
