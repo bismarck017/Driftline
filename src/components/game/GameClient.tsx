@@ -41,6 +41,12 @@ export function GameClient() {
   const [stats, setStats] = useState<HudStats | null>(null);
   const [showHints, setShowHints] = useState(true);
   const [fatal, setFatal] = useState<string | null>(null);
+  const [unit, setUnit] = useState<"kmh" | "mph">(() => {
+    if (typeof window !== "undefined" && window.localStorage.getItem("driftline-unit") === "mph") {
+      return "mph";
+    }
+    return "kmh";
+  });
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<DriveGame | null>(null);
@@ -111,6 +117,18 @@ export function GameClient() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [view]);
+
+  const toggleUnit = () => {
+    setUnit((u) => {
+      const next = u === "kmh" ? "mph" : "kmh";
+      try {
+        window.localStorage.setItem("driftline-unit", next);
+      } catch {
+        // private mode — persistence is best-effort only
+      }
+      return next;
+    });
+  };
 
   const backToGarage = () => {
     setPaused(false);
@@ -261,15 +279,22 @@ export function GameClient() {
 
       {!loading && stats && (
         <>
-          {/* speed panel */}
-          <div className="pointer-events-none absolute left-5 top-5 z-10 flex items-end gap-3 rounded-3xl bg-white/70 px-6 py-4 shadow-xl shadow-stone-900/10 backdrop-blur-md">
+          {/* speed panel — click to switch km/h ⇄ mph */}
+          <button
+            onClick={toggleUnit}
+            aria-label={`Speed in ${unit === "kmh" ? "kilometres per hour" : "miles per hour"}. Click to switch units.`}
+            className="absolute left-5 top-5 z-10 flex cursor-pointer select-none items-end gap-3 rounded-3xl bg-white/70 px-6 py-4 text-left shadow-xl shadow-stone-900/10 backdrop-blur-md transition-all hover:bg-white/85 active:scale-[0.97]"
+          >
             <span className="text-5xl font-bold tabular-nums leading-none text-stone-800">
-              {stats.kmh}
+              {unit === "kmh" ? stats.kmh : Math.round(stats.kmh * 0.621371)}
             </span>
-            <span className="pb-1 text-xs font-semibold uppercase tracking-widest text-stone-400">
-              km/h
+            <span className="flex flex-col gap-0.5 pb-1">
+              <span className="text-xs font-semibold uppercase tracking-widest text-stone-500">
+                {unit === "kmh" ? "km/h" : "mph"}
+              </span>
+              <span className="text-[9px] leading-none text-stone-400">tap to switch</span>
             </span>
-          </div>
+          </button>
 
           {/* biome + position */}
           <div className="pointer-events-none absolute bottom-5 left-5 z-10 rounded-2xl bg-white/70 px-5 py-3 shadow-lg shadow-stone-900/10 backdrop-blur-md">

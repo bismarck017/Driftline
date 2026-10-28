@@ -148,8 +148,8 @@ export class DriveGame {
       c.bottom = -95;
       c.near = 1;
       c.far = 400;
-      this.sun.shadow.bias = -0.0004;
-      this.sun.shadow.normalBias = 0.6;
+      this.sun.shadow.bias = -0.0003;
+      this.sun.shadow.normalBias = 0.35;
     }
     this.scene.add(this.sun);
     this.scene.add(this.sun.target);
@@ -167,7 +167,6 @@ export class DriveGame {
     this.heading = spawn.heading;
     this.smoothY = this.pos.y;
     this.tiles.preload(this.pos.x, this.pos.z);
-
     // ── input ──
     this.resizeHandler = () => this.resize();
     window.addEventListener("resize", this.resizeHandler);
@@ -340,6 +339,10 @@ export class DriveGame {
     const behind = heightAt(this.pos.x - dirX * 2, this.pos.z - dirZ * 2);
     const slope = (ahead - behind) / 4;
     this.speed -= slope * 16 * dt;
+    // steep faces act like walls: extra braking beyond ~50% grade so the car
+    // can't claw its way up cliffs (this is what prevented sinking/porpoising)
+    if (slope > 0.5 && this.speed > 0) this.speed -= (slope - 0.5) * 120 * dt;
+    if (slope < -0.5 && this.speed < 0) this.speed -= (slope + 0.5) * 120 * dt;
 
     // steering
     const speedRatio = clamp(Math.abs(this.speed) / 10, 0, 1);
@@ -359,26 +362,26 @@ export class DriveGame {
       return;
     }
 
-    // ground follow with soft suspension
-    const wheelH =
-      (heightAt(this.pos.x + dirX * 1.4, this.pos.z + dirZ * 1.4) +
-        heightAt(this.pos.x - dirX * 1.4, this.pos.z - dirZ * 1.4) +
-        heightAt(this.pos.x - dirZ * 1.1, this.pos.z + dirX * 1.1) +
-        heightAt(this.pos.x + dirZ * 1.1, this.pos.z - dirX * 1.1)) /
-      4;
-    const targetY = Math.max(wheelH, -0.15) + this.car.wheelR;
-    this.smoothY = lerp(this.smoothY, targetY, 1 - Math.exp(-14 * dt));
-    this.pos.y = this.smoothY;
+    // ground follow with soft suspension — anti-sink:
+    //  · body height = average of the four wheel contact points (physical)
+    //  · if the terrain pokes up under the chassis centre (crest), lift to clear
+    //  · rise quickly (no lagging into uphills), settle down gently (airtime)
+    const hFL = heightAt(this.pos.x - dirZ * 1.1 + dirX * 1.4, this.pos.z + dirX * 1.1 + dirZ * 1.4);
+    const hFR = heightAt(this.pos.x + dirZ * 1.1 + dirX * 1.4, this.pos.z - dirX * 1.1 + dirZ * 1.4);
+    const hRL = heightAt(this.pos.x - dirZ * 1.1 - dirX * 1.4, this.pos.z + dirX * 1.1 - dirZ * 1.4);
+    const hRR = heightAt(this.pos.x + dirZ * 1.1 - dirX * 1.4, this.pos.z - dirX * 1.1 - dirZ * 1.4);
+    const hC = heightAt(this.pos.x, this.pos.z);
+    const avg = (hFL + hFR + hRL + hRR) / 4;
+    const groundH = Math.max(avg, hC - 0.25);
+    const targetY = Math.max(groundH, -0.15);
+    const rate = targetY >= this.smoothY ? 26 : 9;
+    this.smoothY = lerp(this.smoothY, targetY, 1 - Math.exp(-rate * dt));
+    // hard floor: the chassis can never dip below the terrain under the wheels
+    this.pos.y = Math.max(this.smoothY, Math.max(hFL, hFR, hRL, hRR, hC) - 0.35);
 
-    // body attitude from terrain
-    const forwardPitch = Math.atan2(
-      heightAt(this.pos.x + dirX * 1.4, this.pos.z + dirZ * 1.4) - heightAt(this.pos.x - dirX * 1.4, this.pos.z - dirZ * 1.4),
-      2.8
-    );
-    const sideRoll = Math.atan2(
-      heightAt(this.pos.x - dirZ * 1.1, this.pos.z + dirX * 1.1) - heightAt(this.pos.x + dirZ * 1.1, this.pos.z - dirX * 1.1),
-      2.2
-    );
+    // body attitude from terrain (reuse the wheel samples — cheap and smooth)
+    const forwardPitch = Math.atan2((hFL + hFR) / 2 - (hRL + hRR) / 2, 2.8);
+    const sideRoll = Math.atan2((hFL + hRL) / 2 - (hFR + hRR) / 2, 2.2);
     this.pitch = lerp(this.pitch, forwardPitch, 1 - Math.exp(-8 * dt));
     this.roll = lerp(this.roll, sideRoll + this.steerAngle * clamp(this.speed / 40, 0, 1) * 0.18, 1 - Math.exp(-8 * dt));
 
@@ -457,6 +460,11 @@ export class DriveGame {
       this.hudTimer = 0;
       const h = heightAt(this.pos.x, this.pos.z);
       const tt = h < 0.35 && !isOnRoad(this.pos.x, this.pos.z) ? "ocean" : terrainTypeAt(this.pos.x, this.pos.z, Math.max(h, 0));
+      if (typeof window !== "undefined" && (window as unknown as Record<string, unknown>).__dlDebug) {
+        console.log(
+          `[dl] x=${this.pos.x.toFixed(1)} z=${this.pos.z.toFixed(1)} carY=${this.pos.y.toFixed(2)} terrain=${h.toFixed(2)} agl=${(this.pos.y - h).toFixed(2)}`
+        );
+      }
       this.onHud({
         kmh: Math.round(Math.abs(this.speed) * 3.6),
         biome: BIOME_LABEL[tt] ?? tt,

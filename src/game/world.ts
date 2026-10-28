@@ -43,8 +43,8 @@ function baseHeight(x: number, z: number): number {
 // continuous, never-interrupted roads across any tile boundary.
 
 export const ROAD_SPACING = 340;
-export const ROAD_HALF = 5.2; // asphalt half width
-const ROAD_SHOULDER = 11; // flatten blend distance
+export const ROAD_HALF = 6.0; // asphalt half width (two lanes)
+export const ROAD_SHOULDER = 16; // flatten blend distance (gentle causeway banks)
 const WARP_AMPL = 46;
 
 function warpNS(z: number): number {
@@ -54,25 +54,56 @@ function warpEW(x: number): number {
   return (fbm1(x * 0.0031, 3, 2003) - 0.5) * 2 * WARP_AMPL;
 }
 
-/** Distance from (x,z) to the nearest road centerline */
-export function roadDistance(x: number, z: number): number {
-  // vertical roads
-  const kv = Math.round((x - warpNS(z)) / ROAD_SPACING);
-  let best = Infinity;
+/** Rich query about the nearest road — used for painting and physics. */
+export interface RoadInfo {
+  /** distance to the nearest road centerline */
+  dist: number;
+  /** orientation of the nearest road: 0 = north-south, 1 = east-west */
+  axis: 0 | 1;
+  /** coordinate along the road (z for NS roads, x for EW roads) */
+  along: number;
+  /** distance to the nearest road of the OTHER orientation (intersection test) */
+  otherDist: number;
+}
+
+export function roadInfo(x: number, z: number): RoadInfo {
+  const wNS = warpNS(z);
+  const kv = Math.round((x - wNS) / ROAD_SPACING);
+  let bestV = Infinity;
   for (let dk = -1; dk <= 1; dk++) {
     const k = kv + dk;
-    const d = Math.abs(x - (k * ROAD_SPACING + warpNS(z)));
-    if (d < best) best = d;
+    const d = Math.abs(x - (k * ROAD_SPACING + wNS));
+    if (d < bestV) bestV = d;
   }
-  // horizontal roads
-  const mh = Math.round((z - warpEW(x)) / ROAD_SPACING);
+  const wEW = warpEW(x);
+  const mh = Math.round((z - wEW) / ROAD_SPACING);
+  let bestH = Infinity;
   for (let dm = -1; dm <= 1; dm++) {
     const m = mh + dm;
-    const d = Math.abs(z - (m * ROAD_SPACING + warpEW(x)));
-    if (d < best) best = d;
+    const d = Math.abs(z - (m * ROAD_SPACING + wEW));
+    if (d < bestH) bestH = d;
   }
-  return best;
+  if (bestV <= bestH) return { dist: bestV, axis: 0, along: z, otherDist: bestH };
+  return { dist: bestH, axis: 1, along: x, otherDist: bestV };
 }
+
+/** Distance from (x,z) to the nearest road centerline */
+export function roadDistance(x: number, z: number): number {
+  return roadInfo(x, z).dist;
+}
+
+/** Centerline x of the north-south road k at depth z (for marking meshes) */
+export function roadCenterNS(k: number, z: number): number {
+  return k * ROAD_SPACING + warpNS(z);
+}
+
+/** Centerline z of the east-west road m at position x (for marking meshes) */
+export function roadCenterEW(m: number, x: number): number {
+  return m * ROAD_SPACING + warpEW(x);
+}
+
+/** Road curvature bound (warp amplitude) — used to bound candidate searches */
+export const ROAD_WARP = WARP_AMPL;
 
 /** 1.0 on the asphalt, fading to 0 at the shoulder edge */
 export function roadMask(x: number, z: number): number {
@@ -188,7 +219,7 @@ const C = {
   desert: [0.93, 0.83, 0.68] as RGB, // pastel sand / pinkish dune
   highlands: [0.76, 0.72, 0.68] as RGB, // warm grey rock
   snow: [0.95, 0.94, 0.94] as RGB, // off white
-  road: [0.58, 0.57, 0.56] as RGB, // soft asphalt
+  road: [0.52, 0.51, 0.5] as RGB, // soft asphalt
   roadEdge: [0.78, 0.75, 0.71] as RGB, // gravel shoulder
 };
 
@@ -228,16 +259,31 @@ export function terrainColorAt(x: number, z: number, h: number, out: RGB): void 
   out[1] = base[1] * jitter;
   out[2] = base[2] * jitter;
 
-  // road paint (asphalt core, gravel shoulder band)
-  const rd = roadDistance(x, z);
+  // road paint: asphalt, wheel tracks, dashed centerline, lane edges,
+  // gravel shoulder band — all deterministic so tiles match seamlessly
+  const ri = roadInfo(x, z);
+  const rd = ri.dist;
   if (rd < ROAD_SHOULDER) {
     if (rd < ROAD_HALF) {
-      const t = smoothstep(ROAD_HALF - 1.2, ROAD_HALF, rd);
-      const col: RGB = [lerp(C.road[0], C.roadEdge[0], t), lerp(C.road[1], C.roadEdge[1], t), lerp(C.road[2], C.roadEdge[2], t)];
-      out[0] = lerp(out[0], col[0], 0.92);
-      out[1] = lerp(out[1], col[1], 0.92);
-      out[2] = lerp(out[2], col[2], 0.92);
+      // asphalt core with worn wheel tracks
+      const t = smoothstep(ROAD_HALF - 1.0, ROAD_HALF, rd);
+      out[0] = lerp(out[0], C.road[0], 0.94);
+      out[1] = lerp(out[1], C.road[1], 0.94);
+      out[2] = lerp(out[2], C.road[2], 0.94);
+      if (Math.abs(rd - ROAD_HALF * 0.4) < ROAD_HALF * 0.16) {
+        const wear = 0.9 + 0.06 * t;
+        out[0] *= wear;
+        out[1] *= wear;
+        out[2] *= wear;
+      }
+      // (crisp dashed centerlines and lane-edge lines are built as real
+      // meshes by the tile builder, so they stay sharp at any vertex density)
+      // soften into the shoulder at the very edge
+      out[0] = lerp(out[0], C.roadEdge[0], t * 0.55);
+      out[1] = lerp(out[1], C.roadEdge[1], t * 0.55);
+      out[2] = lerp(out[2], C.roadEdge[2], t * 0.55);
     } else {
+      // gravel shoulder band
       const t = 1 - smoothstep(ROAD_HALF, ROAD_SHOULDER, rd);
       out[0] = lerp(out[0], C.roadEdge[0], t * 0.85);
       out[1] = lerp(out[1], C.roadEdge[1], t * 0.85);

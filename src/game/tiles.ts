@@ -5,12 +5,19 @@
 // math model; when the tile falls outside the render distance it is disposed.
 // ─────────────────────────────────────────────────────────────────────────────
 import * as THREE from "three";
+import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import {
   TILE,
   SEA_LEVEL,
   heightAt,
   terrainColorAt,
   propsForTile,
+  roadInfo,
+  roadCenterNS,
+  roadCenterEW,
+  ROAD_SPACING,
+  ROAD_WARP,
+  ROAD_HALF,
   type PropSpot,
 } from "./world";
 
@@ -73,6 +80,7 @@ export class TileManager {
   private lastTj = NaN;
 
   terrainMat: THREE.MeshStandardMaterial;
+  markingMat: THREE.MeshStandardMaterial;
   waterUniforms: { time: { value: number } };
 
   constructor(scene: THREE.Scene, radius: number, waterUniforms: { time: { value: number } }) {
@@ -84,6 +92,13 @@ export class TileManager {
       roughness: 0.96,
       metalness: 0,
       flatShading: true,
+    });
+    this.markingMat = new THREE.MeshStandardMaterial({
+      color: 0xf3eedd,
+      roughness: 0.85,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -2,
     });
   }
 
@@ -155,6 +170,7 @@ export class TileManager {
     this.tiles.clear();
     this.queue.length = 0;
     this.terrainMat.dispose();
+    this.markingMat.dispose();
   }
 
   private disposeTile(tile: TileEntry) {
@@ -246,9 +262,125 @@ export class TileManager {
     const props = this.buildProps(propsForTile(ti, tj));
     props.forEach((p) => group.add(p));
 
+    // ── road markings (dashed centerlines + lane edges as real geometry) ──
+    const markings = this.buildRoadMarkings(ti, tj);
+    if (markings) {
+      group.add(markings);
+      disposables.push(markings.geometry);
+    }
+
     group.position.set(ox + TILE / 2, 0, oz + TILE / 2);
     this.scene.add(group);
     return { key: `${ti},${tj}`, group, terrain, water, props, disposables };
+  }
+
+  /**
+   * Road markings as real geometry (merged boxes, one mesh per tile):
+   *   · dashed cream centerlines following the curved road lattice
+   *   · solid lane-edge lines just inside the asphalt
+   *   · omitted near intersections so crossings stay clean
+   * Deterministic in world space, so markings continue seamlessly across tiles.
+   */
+  private buildRoadMarkings(ti: number, tj: number): THREE.Mesh | null {
+    const ox = ti * TILE;
+    const oz = tj * TILE;
+    // tile group is translated to the tile centre, so boxes are built LOCAL
+    const cx = ox + TILE / 2;
+    const cz = oz + TILE / 2;
+    const geos: THREE.BufferGeometry[] = [];
+    const dashW = 0.5;
+    const dashL = 3.2;
+    const dashStep = 14;
+    const edgeW = 0.3;
+    const edgeStep = 4;
+    const edgeL = edgeStep + 0.15; // slight overlap so the line is continuous
+    const edgeOff = ROAD_HALF - 1.15;
+    const clear = ROAD_HALF + 2.5;
+
+    const push = (x: number, y: number, z: number, w: number, d: number, ry: number) => {
+      const g = new THREE.BoxGeometry(w, 0.05, d);
+      if (ry) g.rotateY(ry);
+      g.translate(x - cx, y, z - cz);
+      geos.push(g);
+    };
+
+    // north-south roads: centerline x = k*S + warp(z), along = z
+    const kMin = Math.floor((ox - ROAD_WARP) / ROAD_SPACING) - 1;
+    const kMax = Math.ceil((ox + TILE + ROAD_WARP) / ROAD_SPACING) + 1;
+    for (let k = kMin; k <= kMax; k++) {
+      // dashes
+      for (let m = Math.floor(oz / dashStep) - 1; m <= Math.ceil((oz + TILE) / dashStep) + 1; m++) {
+        const z = m * dashStep + dashStep / 2;
+        if (z < oz - 0.5 || z > oz + TILE + 0.5) continue;
+        const x = roadCenterNS(k, z);
+        if (x < ox - 0.5 || x > ox + TILE + 0.5) continue;
+        const ri = roadInfo(x, z);
+        if (ri.otherDist < clear) continue;
+        const h = heightAt(x, z);
+        if (h < 0.9) continue;
+        const x2 = roadCenterNS(k, z + 1);
+        push(x, h + 0.045, z, dashW, dashL, Math.atan2(x2 - x, 1));
+      }
+      // edge lines (segmented strips following the curve)
+      for (let s = Math.floor(oz / edgeStep) - 1; s <= Math.ceil((oz + TILE) / edgeStep) + 1; s++) {
+        const z = s * edgeStep + edgeStep / 2;
+        if (z < oz - 0.5 || z > oz + TILE + 0.5) continue;
+        const xc = roadCenterNS(k, z);
+        const x2 = roadCenterNS(k, z + 1);
+        const ry = Math.atan2(x2 - xc, 1);
+        for (const side of [-1, 1]) {
+          const x = xc + side * edgeOff;
+          if (x < ox - 0.5 || x > ox + TILE + 0.5) continue;
+          const ri = roadInfo(x, z);
+          if (ri.otherDist < clear) continue;
+          const h = heightAt(x, z);
+          if (h < 0.9) continue;
+          push(x, h + 0.04, z, edgeW, edgeL, ry);
+        }
+      }
+    }
+
+    // east-west roads: centerline z = m*S + warp(x), along = x
+    const mMin = Math.floor((oz - ROAD_WARP) / ROAD_SPACING) - 1;
+    const mMax = Math.ceil((oz + TILE + ROAD_WARP) / ROAD_SPACING) + 1;
+    for (let m = mMin; m <= mMax; m++) {
+      for (let n = Math.floor(ox / dashStep) - 1; n <= Math.ceil((ox + TILE) / dashStep) + 1; n++) {
+        const x = n * dashStep + dashStep / 2;
+        if (x < ox - 0.5 || x > ox + TILE + 0.5) continue;
+        const z = roadCenterEW(m, x);
+        if (z < oz - 0.5 || z > oz + TILE + 0.5) continue;
+        const ri = roadInfo(x, z);
+        if (ri.otherDist < clear) continue;
+        const h = heightAt(x, z);
+        if (h < 0.9) continue;
+        const z2 = roadCenterEW(m, x + 1);
+        push(x, h + 0.045, z, dashL, dashW, Math.atan2(1, z2 - z));
+      }
+      for (let s = Math.floor(ox / edgeStep) - 1; s <= Math.ceil((ox + TILE) / edgeStep) + 1; s++) {
+        const x = s * edgeStep + edgeStep / 2;
+        if (x < ox - 0.5 || x > ox + TILE + 0.5) continue;
+        const zc = roadCenterEW(m, x);
+        const z2 = roadCenterEW(m, x + 1);
+        const ry = Math.atan2(1, z2 - zc);
+        for (const side of [-1, 1]) {
+          const z = zc + side * edgeOff;
+          if (z < oz - 0.5 || z > oz + TILE + 0.5) continue;
+          const ri = roadInfo(x, z);
+          if (ri.otherDist < clear) continue;
+          const h = heightAt(x, z);
+          if (h < 0.9) continue;
+          push(x, h + 0.04, z, edgeL, edgeW, ry);
+        }
+      }
+    }
+
+    if (geos.length === 0) return null;
+    const merged = mergeGeometries(geos, false);
+    geos.forEach((g) => g.dispose());
+    if (!merged) return null;
+    const mesh = new THREE.Mesh(merged, this.markingMat);
+    mesh.receiveShadow = true;
+    return mesh;
   }
 
   private buildProps(spots: PropSpot[]): THREE.InstancedMesh[] {
