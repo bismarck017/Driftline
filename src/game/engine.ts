@@ -6,6 +6,8 @@ import * as THREE from "three";
 import { TileManager } from "./tiles";
 import { buildCar, type CarSpec, type BuiltCar } from "./cars";
 import { clamp, lerp } from "./noise";
+import type { NetClient } from "./net";
+import { RemotePlayers } from "./remotes";
 import {
   TILE,
   surfaceHeightAt,
@@ -30,6 +32,7 @@ export interface HudStats {
   revs: number; // 0..1 (0 = idle, 1 = redline)
   distance: number; // metres travelled
   locked: boolean; // wheels locked & skidding under heavy braking
+  online: number; // other players in the room (0 = solo drive)
 }
 
 export interface EngineOptions {
@@ -39,6 +42,7 @@ export interface EngineOptions {
   timeOfDay?: number; // starting hour [0, 24)
   cycleEnabled?: boolean; // advance time automatically?
   dayLength?: number; // real seconds per in-world day
+  net?: NetClient; // join a multiplayer room (optional)
 }
 
 const BIOME_LABEL: Record<string, string> = {
@@ -226,6 +230,10 @@ export class DriveGame {
   private smokeAcc = 0; // puff-rate accumulator
   private wasLocked = false; // for the lockup smoke burst
 
+  // multiplayer (optional)
+  private net: NetClient | null = null;
+  private remotes: RemotePlayers | null = null;
+
   // day-night state
   private todHours = 10; // in-world hour [0, 24)
   private cycleEnabled = true;
@@ -390,6 +398,28 @@ export class DriveGame {
     this.pos.set(spawn.x, surfaceHeightAt(spawn.x, spawn.z), spawn.z);
     this.heading = spawn.heading;
     this.smoothY = this.pos.y;
+
+    // ── multiplayer: render everyone else in the room ──
+    if (opts.net) {
+      this.net = opts.net;
+      this.remotes = new RemotePlayers(this.scene);
+      this.net.events.onRoster = (players) => this.remotes?.applyRoster(players);
+      this.net.events.onSnap = (states) => this.remotes?.applySnap(states);
+      // the server rejected our movement — snap back to its last accepted pose
+      this.net.events.onFix = (x, y, z, h) => {
+        this.pos.set(x, y, z);
+        this.heading = h;
+        this.speed = 0;
+        this.smoothY = y;
+        this.skidLastL = null;
+        this.skidLastR = null;
+      };
+      // the room usually already existed while the world was loading —
+      // replay whatever the socket cached so nobody is invisible at spawn
+      if (this.net.lastRoster) this.remotes.applyRoster(this.net.lastRoster);
+      if (this.net.lastSnap) this.remotes.applySnap(this.net.lastSnap);
+    }
+
     this.tiles.preload(this.pos.x, this.pos.z);
     // ── input ──
     this.resizeHandler = () => this.resize();
@@ -510,6 +540,7 @@ export class DriveGame {
       if (m) m.dispose();
     });
     this.tiles.disposeAll();
+    this.remotes?.dispose();
     this.skidGeo.dispose();
     this.skidMat.dispose();
     this.smokeTex.dispose();
@@ -1008,6 +1039,20 @@ export class DriveGame {
     this.updatePhysics(dt);
     this.tiles.update(this.pos.x, this.pos.z);
 
+    // multiplayer: ship our predicted state, advance everyone else's cars
+    if (this.net && this.remotes) {
+      this.net.publish({
+        x: this.pos.x,
+        y: this.pos.y,
+        z: this.pos.z,
+        h: this.heading,
+        s: this.speed,
+        st: this.steerAngle,
+      });
+      this.net.tick(dt);
+      this.remotes.update(dt, this.pos);
+    }
+
     // shadow frustum follows the car (snapped to reduce shimmer); the light
     // itself comes from the sun by day and the moon by night
     const sx = Math.round(this.pos.x / 2) * 2;
@@ -1050,6 +1095,7 @@ export class DriveGame {
         revs: this.revs,
         distance: this.odometer,
         locked: this.locked,
+        online: this.remotes ? this.remotes.count : 0,
       });
     }
   };

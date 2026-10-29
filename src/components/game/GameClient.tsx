@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { CARS, type CarSpec } from "@/game/cars";
 import { DriveGame, type HudStats } from "@/game/engine";
+import { NetClient, parseJoinLink, randomName } from "@/game/net";
 import { CarPreview } from "./CarPreview";
 import { Minimap } from "./Minimap";
 import { Button } from "@/components/ui/button";
@@ -82,6 +83,15 @@ export function GameClient() {
     }
     return "kmh";
   });
+  // ── multiplayer UI state ──
+  const [joinOpen, setJoinOpen] = useState(false);
+  const [joinLink, setJoinLink] = useState("");
+  const [joinName, setJoinName] = useState(() =>
+    typeof window === "undefined" ? "" : window.localStorage.getItem("driftline-name") || randomName(),
+  );
+  const [joinBusy, setJoinBusy] = useState(false);
+  const [joinErr, setJoinErr] = useState<string | null>(null);
+  const [mpNote, setMpNote] = useState<string | null>(null);
   const [dn, setDn] = useState<DayNightPrefs>(() =>
     typeof window === "undefined" ? DEFAULT_DN : loadDayNightPrefs(),
   );
@@ -91,6 +101,7 @@ export function GameClient() {
   const carRef = useRef<CarSpec>(CARS[0]);
   const settingsRef = useRef({ radius, shadows });
   const dnRef = useRef(dn);
+  const netRef = useRef<NetClient | null>(null);
 
   // persist day-night prefs (best-effort)
   useEffect(() => {
@@ -127,6 +138,7 @@ export function GameClient() {
           timeOfDay: dnRef.current.time,
           cycleEnabled: dnRef.current.cycle,
           dayLength: dnRef.current.dayLength,
+          net: netRef.current ?? undefined,
         });
         engineRef.current = engine;
         engine.start();
@@ -204,7 +216,43 @@ export function GameClient() {
     setPaused(false);
     setStats(null);
     setFatal(null);
+    netRef.current?.close();
+    netRef.current = null;
+    setMpNote(null);
     setView("garage");
+  };
+
+  // ── multiplayer join flow ───────────────────────────────────────────────────
+  const doJoin = async () => {
+    const parsed = parseJoinLink(joinLink);
+    if (!parsed) {
+      setJoinErr("That doesn't look like a server link.");
+      return;
+    }
+    const name = (joinName || randomName()).trim().slice(0, 16);
+    try {
+      window.localStorage.setItem("driftline-name", name);
+    } catch {
+      // best-effort only
+    }
+    setJoinErr(null);
+    setJoinBusy(true);
+    const client = new NetClient(name, carRef.current.id, {
+      onDown: (reason) => setMpNote(reason),
+    });
+    try {
+      await client.connect(parsed.wsUrl, parsed.room);
+      netRef.current = client;
+      setJoinOpen(false);
+      setJoinBusy(false);
+      setJoinLink("");
+      setLoading(true);
+      setView("drive");
+    } catch (err) {
+      client.close();
+      setJoinBusy(false);
+      setJoinErr(err instanceof Error ? err.message : "Couldn't join that server.");
+    }
   };
 
   // ── garage ──────────────────────────────────────────────────────────────────
@@ -294,11 +342,23 @@ export function GameClient() {
                   size="lg"
                   className="mt-6 w-full rounded-2xl bg-stone-800 text-[#f6efe2] hover:bg-stone-700"
                   onClick={() => {
+                    netRef.current?.close(); // solo drive — make sure no socket lingers
+                    netRef.current = null;
                     setLoading(true);
                     setView("drive");
                   }}
                 >
                   Drive the {selectedCar.name}
+                </Button>
+                <Button
+                  variant="outline"
+                  className="mt-2 w-full rounded-2xl border-stone-300 bg-white/40 text-stone-600 hover:bg-white/70 hover:text-stone-800"
+                  onClick={() => {
+                    setJoinErr(null);
+                    setJoinOpen(true);
+                  }}
+                >
+                  Join a server
                 </Button>
               </div>
             </section>
@@ -313,6 +373,69 @@ export function GameClient() {
               <KeyCap>R</KeyCap> back to road
             </span>
           </footer>
+
+          {/* join-a-server dialog */}
+          {joinOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/40 px-4 backdrop-blur-sm">
+              <div className="w-full max-w-md rounded-3xl bg-[#f7f2e7] p-7 shadow-2xl">
+                <h2 className="text-xl font-bold text-stone-800">Join a server</h2>
+                <p className="mt-1 text-sm leading-relaxed text-stone-500">
+                  Paste the link your host shared — it looks like
+                  <span className="font-mono text-xs"> https://some-random-words.trycloudflare.com</span>
+                </p>
+
+                <label className="mt-5 block text-[11px] font-semibold uppercase tracking-[0.2em] text-stone-400">
+                  Server link
+                </label>
+                <input
+                  autoFocus
+                  value={joinLink}
+                  onChange={(e) => setJoinLink(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !joinBusy) void doJoin();
+                  }}
+                  placeholder="https://random-words.trycloudflare.com"
+                  className="mt-1.5 w-full rounded-xl border border-stone-300 bg-white/80 px-3.5 py-2.5 font-mono text-sm text-stone-800 outline-none transition focus:border-stone-500"
+                />
+
+                <label className="mt-4 block text-[11px] font-semibold uppercase tracking-[0.2em] text-stone-400">
+                  Your name
+                </label>
+                <input
+                  value={joinName}
+                  onChange={(e) => setJoinName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !joinBusy) void doJoin();
+                  }}
+                  maxLength={16}
+                  placeholder="Drifter"
+                  className="mt-1.5 w-full rounded-xl border border-stone-300 bg-white/80 px-3.5 py-2.5 text-sm text-stone-800 outline-none transition focus:border-stone-500"
+                />
+
+                {joinErr && <p className="mt-3 text-xs font-medium text-red-700">{joinErr}</p>}
+
+                <div className="mt-6 flex gap-2">
+                  <Button
+                    variant="outline"
+                    className="flex-1 rounded-2xl border-stone-300 bg-transparent text-stone-600 hover:bg-white/60"
+                    onClick={() => setJoinOpen(false)}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    className="flex-1 rounded-2xl bg-stone-800 text-[#f6efe2] hover:bg-stone-700"
+                    disabled={joinBusy}
+                    onClick={() => void doJoin()}
+                  >
+                    {joinBusy ? "Connecting…" : `Connect · drive the ${selectedCar.name}`}
+                  </Button>
+                </div>
+                <p className="mt-3 text-center text-[11px] text-stone-400">
+                  You'll share one endless world with everyone in the room.
+                </p>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -337,6 +460,19 @@ export function GameClient() {
         <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-4 bg-[#f4eee1]">
           <div className="h-10 w-10 animate-spin rounded-full border-[3px] border-stone-300 border-t-stone-700" />
           <p className="text-sm font-medium text-stone-500">Generating the world around you…</p>
+        </div>
+      )}
+
+      {/* multiplayer connection notice */}
+      {mpNote && (
+        <div className="absolute left-1/2 top-5 z-30 flex -translate-x-1/2 items-center gap-3 rounded-2xl bg-[#c2413d]/90 px-4 py-2.5 text-xs font-semibold text-white shadow-lg">
+          <span>{mpNote}</span>
+          <button
+            className="rounded-lg bg-white/20 px-2 py-0.5 text-[10px] uppercase tracking-widest hover:bg-white/35"
+            onClick={() => setMpNote(null)}
+          >
+            dismiss
+          </button>
         </div>
       )}
 
@@ -391,6 +527,11 @@ export function GameClient() {
             </div>
             <div className="mt-1.5 flex items-center gap-2 text-[11px]">
               <span className="font-medium text-stone-500">{stats.biome}</span>
+              {stats.online > 0 && (
+                <span className="rounded-md bg-stone-800/10 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-stone-600">
+                  {stats.online + 1} online
+                </span>
+              )}
             </div>
           </div>
 

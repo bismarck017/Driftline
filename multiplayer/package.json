@@ -1,0 +1,16 @@
+{
+  "name": "driftline-multiplayer",
+  "version": "1.0.0",
+  "description": "Driftline multiplayer server — zero-config room host with an automatic Cloudflare quick tunnel.",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
