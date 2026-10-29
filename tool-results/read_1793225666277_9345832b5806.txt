@@ -1,0 +1,859 @@
+     1→     1→// ─────────────────────────────────────────────────────────────────────────────
+     2→     2→// Game engine: renderer setup, pastel sky & lighting, arcade car physics on the
+     3→     3→// procedural terrain, chase camera, and the per-frame tile streaming loop.
+     4→     4→// ─────────────────────────────────────────────────────────────────────────────
+     5→     5→import * as THREE from "three";
+     6→     6→import { TileManager } from "./tiles";
+     7→     7→import { buildCar, type CarSpec, type BuiltCar } from "./cars";
+     8→     8→import { clamp, lerp } from "./noise";
+     9→     9→import {
+    10→    10→  TILE,
+    11→    11→  surfaceHeightAt,
+    12→    12→  isOnRoad,
+    13→    13→  roadDistance,
+    14→    14→  terrainTypeAt,
+    15→    15→  findRoadSpawn,
+    16→    16→} from "./world";
+    17→    17→
+    18→    18→export interface HudStats {
+    19→    19→  kmh: number;
+    20→    20→  biome: string;
+    21→    21→  x: number;
+    22→    22→  z: number;
+    23→    23→  tilesLoaded: number;
+    24→    24→  heading: number; // radians
+    25→    25→  onRoad: boolean;
+    26→    26→  clock: string; // "14:23"
+    27→    27→  tod: number; // time of day in hours [0, 24)
+    28→    28→  // drivetrain / gauge cluster
+    29→    29→  gear: number; // -1 = R, 0 = N, 1..N = forward gear
+    30→    30→  revs: number; // 0..1 (0 = idle, 1 = redline)
+    31→    31→  distance: number; // metres travelled
+    32→    32→  locked: boolean; // wheels locked & skidding under heavy braking
+    33→    33→}
+    34→    34→
+    35→    35→export interface EngineOptions {
+    36→    36→  renderRadius: number; // 1 => 3x3, 2 => 5x5
+    37→    37→  shadows: boolean;
+    38→    38→  onHud?: (s: HudStats) => void;
+    39→    39→  timeOfDay?: number; // starting hour [0, 24)
+    40→    40→  cycleEnabled?: boolean; // advance time automatically?
+    41→    41→  dayLength?: number; // real seconds per in-world day
+    42→    42→}
+    43→    43→
+    44→    44→const BIOME_LABEL: Record<string, string> = {
+    45→    45→  ocean: "Open Water",
+    46→    46→  beach: "Shoreline",
+    47→    47→  meadow: "Meadowlands",
+    48→    48→  forest: "Pinewood",
+    49→    49→  desert: "Dunes",
+    50→    50→  highlands: "Highlands",
+    51→    51→  snow: "Snowfield",
+    52→    52→};
+    53→    53→
+    54→    54→// ── Day-night environment ─────────────────────────────────────────────────────
+    55→    55→// Keyframed pastel palettes over 24h: deep night -> dawn rose -> morning mist ->
+    56→    56→// bright pastel noon -> golden hour -> peach sunset -> violet twilight -> night.
+    57→    57→// Terrain keeps its vibrant vertex colours; the cycle only modulates sky, fog,
+    58→    58→// lights, water tint and exposure, so the world stays pastel at every hour.
+    59→    59→
+    60→    60→interface EnvKey {
+    61→    61→  t: number;
+    62→    62→  top: string;
+    63→    63→  hor: string;
+    64→    64→  bot: string;
+    65→    65→  fog: string;
+    66→    66→  sunC: string;
+    67→    67→  sunI: number;
+    68→    68→  hemiS: string;
+    69→    69→  hemiG: string;
+    70→    70→  hemiI: number;
+    71→    71→  night: number;
+    72→    72→  exp: number;
+    73→    73→  water: string;
+    74→    74→}
+    75→    75→
+    76→    76→const ENV_KEYS: EnvKey[] = [
+    77→    77→  { t: 0, top: "#20263f", hor: "#454c6e", bot: "#333953", fog: "#363d5c", sunC: "#aeb9dd", sunI: 0.32, hemiS: "#3a4468", hemiG: "#2e3246", hemiI: 0.34, night: 1, exp: 0.94, water: "#46517a" },
+    78→    78→  { t: 4.6, top: "#2b3455", hor: "#6d5f80", bot: "#454a6b", fog: "#565a80", sunC: "#cabbd0", sunI: 0.38, hemiS: "#4c5379", hemiG: "#3a3c55", hemiI: 0.4, night: 0.85, exp: 0.97, water: "#6b6b95" },
+    79→    79→  { t: 6.3, top: "#7b6d9e", hor: "#f2b8a0", bot: "#d9a99a", fog: "#e7c2ad", sunC: "#ffc9a3", sunI: 1.05, hemiS: "#8f86ad", hemiG: "#b08a7a", hemiI: 0.6, night: 0.22, exp: 1.02, water: "#d9b3a8" },
+    80→    80→  { t: 9, top: "#8fb8d8", hor: "#f6e3c8", bot: "#e6d9c2", fog: "#efe1cc", sunC: "#ffe8cc", sunI: 1.65, hemiS: "#c5dbe8", hemiG: "#c3bba8", hemiI: 0.8, night: 0, exp: 1.06, water: "#e8e2d4" },
+    81→    81→  { t: 13, top: "#9ec4dd", hor: "#f6e9d2", bot: "#e8dcc8", fog: "#f3e7d3", sunC: "#fff2dd", sunI: 1.9, hemiS: "#d7e8ee", hemiG: "#c9c2b2", hemiI: 0.85, night: 0, exp: 1.06, water: "#ffffff" },
+    82→    82→  { t: 16.8, top: "#93b3d4", hor: "#f6ddc0", bot: "#e6d0b8", fog: "#efdcbf", sunC: "#ffe0b8", sunI: 1.75, hemiS: "#c9d8e4", hemiG: "#c4b49e", hemiI: 0.8, night: 0, exp: 1.05, water: "#f2e0cf" },
+    83→    83→  { t: 18.7, top: "#8a76a8", hor: "#f5ad8d", bot: "#d99f92", fog: "#e6b19b", sunC: "#ffab7d", sunI: 1.1, hemiS: "#9d8fae", hemiG: "#a8837a", hemiI: 0.6, night: 0.22, exp: 1.0, water: "#e2b3a2" },
+    84→    84→  { t: 20.2, top: "#3c4470", hor: "#8a6a85", bot: "#4f5273", fog: "#6b5f7f", sunC: "#d0a8c8", sunI: 0.45, hemiS: "#565b85", hemiG: "#47445f", hemiI: 0.42, night: 0.75, exp: 0.96, water: "#7d7ba0" },
+    85→    85→  { t: 24, top: "#20263f", hor: "#454c6e", bot: "#333953", fog: "#363d5c", sunC: "#aeb9dd", sunI: 0.32, hemiS: "#3a4468", hemiG: "#2e3246", hemiI: 0.34, night: 1, exp: 0.94, water: "#46517a" },
+    86→    86→];
+    87→    87→
+    88→    88→interface EnvCompiled {
+    89→    89→  t: number;
+    90→    90→  top: THREE.Color;
+    91→    91→  hor: THREE.Color;
+    92→    92→  bot: THREE.Color;
+    93→    93→  fog: THREE.Color;
+    94→    94→  sunC: THREE.Color;
+    95→    95→  sunI: number;
+    96→    96→  hemiS: THREE.Color;
+    97→    97→  hemiG: THREE.Color;
+    98→    98→  hemiI: number;
+    99→    99→  night: number;
+   100→   100→  exp: number;
+   101→   101→  water: THREE.Color;
+   102→   102→}
+   103→   103→
+   104→   104→let envKeysCompiled: EnvCompiled[] | null = null;
+   105→   105→function getEnvKeys(): EnvCompiled[] {
+   106→   106→  if (!envKeysCompiled) {
+   107→   107→    envKeysCompiled = ENV_KEYS.map((k) => ({
+   108→   108→      t: k.t,
+   109→   109→      top: new THREE.Color(k.top),
+   110→   110→      hor: new THREE.Color(k.hor),
+   111→   111→      bot: new THREE.Color(k.bot),
+   112→   112→      fog: new THREE.Color(k.fog),
+   113→   113→      sunC: new THREE.Color(k.sunC),
+   114→   114→      sunI: k.sunI,
+   115→   115→      hemiS: new THREE.Color(k.hemiS),
+   116→   116→      hemiG: new THREE.Color(k.hemiG),
+   117→   117→      hemiI: k.hemiI,
+   118→   118→      night: k.night,
+   119→   119→      exp: k.exp,
+   120→   120→      water: new THREE.Color(k.water),
+   121→   121→    }));
+   122→   122→  }
+   123→   123→  return envKeysCompiled;
+   124→   124→}
+   125→   125→
+   126→   126→/** Scratch result of sampling the 24h environment. */
+   127→   127→type EnvSample = EnvCompiled;
+   128→   128→
+   129→   129→function sampleEnv(tod: number, out: EnvSample): EnvSample {
+   130→   130→  const keys = getEnvKeys();
+   131→   131→  const t = ((tod % 24) + 24) % 24;
+   132→   132→  let i = 0;
+   133→   133→  while (i < keys.length - 2 && t > keys[i + 1].t) i++;
+   134→   134→  const a = keys[i];
+   135→   135→  const b = keys[i + 1];
+   136→   136→  let u = (t - a.t) / (b.t - a.t);
+   137→   137→  u = u * u * (3 - 2 * u); // smoothstep for buttery transitions
+   138→   138→  out.t = t;
+   139→   139→  out.top.lerpColors(a.top, b.top, u);
+   140→   140→  out.hor.lerpColors(a.hor, b.hor, u);
+   141→   141→  out.bot.lerpColors(a.bot, b.bot, u);
+   142→   142→  out.fog.lerpColors(a.fog, b.fog, u);
+   143→   143→  out.sunC.lerpColors(a.sunC, b.sunC, u);
+   144→   144→  out.hemiS.lerpColors(a.hemiS, b.hemiS, u);
+   145→   145→  out.hemiG.lerpColors(a.hemiG, b.hemiG, u);
+   146→   146→  out.water.lerpColors(a.water, b.water, u);
+   147→   147→  out.sunI = lerp(a.sunI, b.sunI, u);
+   148→   148→  out.hemiI = lerp(a.hemiI, b.hemiI, u);
+   149→   149→  out.night = lerp(a.night, b.night, u);
+   150→   150→  out.exp = lerp(a.exp, b.exp, u);
+   151→   151→  return out;
+   152→   152→}
+   153→   153→
+   154→   154→const _env: EnvSample = {
+   155→   155→  t: 0,
+   156→   156→  top: new THREE.Color(),
+   157→   157→  hor: new THREE.Color(),
+   158→   158→  bot: new THREE.Color(),
+   159→   159→  fog: new THREE.Color(),
+   160→   160→  sunC: new THREE.Color(),
+   161→   161→  sunI: 1,
+   162→   162→  hemiS: new THREE.Color(),
+   163→   163→  hemiG: new THREE.Color(),
+   164→   164→  hemiI: 0.8,
+   165→   165→  night: 0,
+   166→   166→  exp: 1,
+   167→   167→  water: new THREE.Color(),
+   168→   168→};
+   169→   169→
+   170→   170→export class DriveGame {
+   171→   171→  private canvas: HTMLCanvasElement;
+   172→   172→  private renderer: THREE.WebGLRenderer;
+   173→   173→  private scene: THREE.Scene;
+   174→   174→  private camera: THREE.PerspectiveCamera;
+   175→   175→  private clock = new THREE.Clock();
+   176→   176→  private raf = 0;
+   177→   177→  private paused = false;
+   178→   178→  private disposed = false;
+   179→   179→
+   180→   180→  private tiles: TileManager;
+   181→   181→  private sun: THREE.DirectionalLight;
+   182→   182→  private sky: THREE.Mesh;
+   183→   183→  private waterTime = { value: 0 };
+   184→   184→
+   185→   185→  private car: CarSpec;
+   186→   186→  private built: BuiltCar;
+   187→   187→  private pos = new THREE.Vector3();
+   188→   188→  private heading = 0;
+   189→   189→  private speed = 0;
+   190→   190→  private steerAngle = 0;
+   191→   191→  private pitch = 0;
+   192→   192→  private roll = 0;
+   193→   193→  private smoothY = 0;
+   194→   194→  private wheelSpin = 0;
+   195→   195→  private cameraMode = 0; // 0 chase, 1 far cinematic
+   196→   196→  private hudTimer = 0;
+   197→   197→  private stuckTimer = 0; // bogged-in-water watchdog
+   198→   198→
+   199→   199→  // drivetrain & tire state
+   200→   200→  private gear = 1;
+   201→   201→  private gearTop: number[] = []; // shift points (m/s) per forward gear
+   202→   202→  private revs = 0;
+   203→   203→  private odometer = 0; // metres travelled
+   204→   204→  private lockProg = 0; // brake-lockup accumulation 0..1
+   205→   205→  private locked = false;
+   206→   206→  private throttleIn = false;
+   207→   207→  private revBlend = 0; // 0 = chase cam behind, 1 = reverse cam ahead
+   208→   208→
+   209→   209→  // day-night state
+   210→   210→  private todHours = 10; // in-world hour [0, 24)
+   211→   211→  private cycleEnabled = true;
+   212→   212→  private dayLength = 240; // real seconds per in-world day
+   213→   213→  private hemi!: THREE.HemisphereLight;
+   214→   214→  private skyU!: Record<string, THREE.IUniform>;
+   215→   215→  private waterTint = { value: new THREE.Color(1, 1, 1) };
+   216→   216→  private headlights!: THREE.SpotLight;
+   217→   217→  private glowMats: [THREE.MeshStandardMaterial, number][] = [];
+   218→   218→  private _sunDir = new THREE.Vector3();
+   219→   219→
+   220→   220→  private keys = new Set<string>();
+   221→   221→  private opts: EngineOptions;
+   222→   222→  private onHud?: (s: HudStats) => void;
+   223→   223→  private resizeHandler: () => void;
+   224→   224→
+   225→   225→  constructor(canvas: HTMLCanvasElement, car: CarSpec, opts: EngineOptions) {
+   226→   226→    this.canvas = canvas;
+   227→   227→    this.car = car;
+   228→   228→    this.opts = opts;
+   229→   229→    this.onHud = opts.onHud;
+   230→   230→
+   231→   231→    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
+   232→   232→    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+   233→   233→    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+   234→   234→    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+   235→   235→    this.renderer.toneMappingExposure = 1.06;
+   236→   236→    this.renderer.shadowMap.enabled = opts.shadows;
+   237→   237→    this.renderer.shadowMap.type = THREE.PCFShadowMap;
+   238→   238→
+   239→   239→    this.scene = new THREE.Scene();
+   240→   240→    this.scene.fog = new THREE.Fog(0xf3e7d3, opts.renderRadius * TILE * 0.7, opts.renderRadius * TILE * 1.55 + 120);
+   241→   241→
+   242→   242→    this.camera = new THREE.PerspectiveCamera(58, 1, 0.3, 6000);
+   243→   243→
+   244→   244→    this.todHours = ((opts.timeOfDay ?? 10) % 24 + 24) % 24;
+   245→   245→    this.cycleEnabled = opts.cycleEnabled ?? true;
+   246→   246→    this.dayLength = opts.dayLength ?? 240;
+   247→   247→
+   248→   248→    // ── pastel sky dome (with day-night stars + moon) ──
+   249→   249→    const skyGeo = new THREE.SphereGeometry(3200, 24, 16);
+   250→   250→    const skyMat = new THREE.ShaderMaterial({
+   251→   251→      side: THREE.BackSide,
+   252→   252→      depthWrite: false,
+   253→   253→      fog: false,
+   254→   254→      uniforms: {
+   255→   255→        top: { value: new THREE.Color(0x9ec4dd) },
+   256→   256→        horizon: { value: new THREE.Color(0xf6e9d2) },
+   257→   257→        bottom: { value: new THREE.Color(0xe8dcc8) },
+   258→   258→        sunDir: { value: new THREE.Vector3(0.45, 0.55, 0.35).normalize() },
+   259→   259→        sunColor: { value: new THREE.Color(0xfff2dd) },
+   260→   260→        night: { value: 0 },
+   261→   261→        time: this.waterTime, // shared clock (also drives the star twinkle)
+   262→   262→      },
+   263→   263→      vertexShader: `
+   264→   264→        varying vec3 vDir;
+   265→   265→        void main() {
+   266→   266→          vDir = normalize(position);
+   267→   267→          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+   268→   268→          gl_Position = projectionMatrix * mv;
+   269→   269→        }
+   270→   270→      `,
+   271→   271→      fragmentShader: `
+   272→   272→        uniform vec3 top;
+   273→   273→        uniform vec3 horizon;
+   274→   274→        uniform vec3 bottom;
+   275→   275→        uniform vec3 sunDir;
+   276→   276→        uniform vec3 sunColor;
+   277→   277→        uniform float night;
+   278→   278→        uniform float time;
+   279→   279→        varying vec3 vDir;
+   280→   280→        void main() {
+   281→   281→          float h = vDir.y;
+   282→   282→          vec3 col = h > 0.0 ? mix(horizon, top, pow(min(h, 1.0), 0.62))
+   283→   283→                             : mix(horizon, bottom, min(-h * 3.0, 1.0));
+   284→   284→          vec3 sd = normalize(sunDir);
+   285→   285→          vec3 dir = normalize(vDir);
+   286→   286→          float sunDot = max(dot(dir, sd), 0.0);
+   287→   287→          float sunVis = smoothstep(-0.10, 0.06, sd.y);
+   288→   288→          float sun = pow(sunDot, 240.0) * 0.9 + pow(sunDot, 8.0) * 0.16;
+   289→   289→          col += sunColor * sun * (1.0 - night) * sunVis;
+   290→   290→          // moon rides the opposite arc, crisp pale disc + faint glow
+   291→   291→          vec3 md = -sd;
+   292→   292→          float moonDot = max(dot(dir, md), 0.0);
+   293→   293→          float moonVis = smoothstep(-0.10, 0.06, md.y);
+   294→   294→          float moon = pow(moonDot, 900.0) * 1.1 + pow(moonDot, 90.0) * 0.10;
+   295→   295→          col += vec3(0.85, 0.90, 1.0) * moon * night * moonVis;
+   296→   296→          // starfield — hash-jittered points per cell, twinkling, fading at horizon
+   297→   297→          if (night > 0.02 && h > 0.02) {
+   298→   298→            vec3 sp = dir * 190.0;
+   299→   299→            vec3 cell = floor(sp);
+   300→   300→            vec3 f = fract(sp) - 0.5;
+   301→   301→            float h1 = fract(sin(dot(cell, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+   302→   302→            float h2 = fract(sin(dot(cell, vec3(269.5, 183.3, 246.1))) * 28001.8384);
+   303→   303→            float h3 = fract(sin(dot(cell, vec3(113.5, 271.9, 124.6))) * 31373.5453);
+   304→   304→            vec3 jitter = (vec3(h1, h2, h3) - 0.5) * 0.55;
+   305→   305→            float d = length(f - jitter);
+   306→   306→            float star = smoothstep(0.16, 0.02, d) * step(0.992, h2);
+   307→   307→            float tw = 0.65 + 0.35 * sin(time * 2.0 + h1 * 41.0);
+   308→   308→            col += vec3(0.92, 0.94, 1.0) * star * tw * night * smoothstep(0.02, 0.25, h);
+   309→   309→          }
+   310→   310→          gl_FragColor = vec4(col, 1.0);
+   311→   311→        }
+   312→   312→      `,
+   313→   313→    });
+   314→   314→    this.sky = new THREE.Mesh(skyGeo, skyMat);
+   315→   315→    this.skyU = skyMat.uniforms as Record<string, THREE.IUniform>;
+   316→   316→    this.scene.add(this.sky);
+   317→   317→
+   318→   318→    // ── lighting ──
+   319→   319→    const hemi = new THREE.HemisphereLight(0xd7e8ee, 0xc9c2b2, 0.85);
+   320→   320→    this.hemi = hemi;
+   321→   321→    this.scene.add(hemi);
+   322→   322→    this.sun = new THREE.DirectionalLight(0xfff2dd, 1.9);
+   323→   323→    this.sun.position.set(60, 90, 40);
+   324→   324→    if (opts.shadows) {
+   325→   325→      this.sun.castShadow = true;
+   326→   326→      this.sun.shadow.mapSize.set(2048, 2048);
+   327→   327→      const c = this.sun.shadow.camera;
+   328→   328→      c.left = -95;
+   329→   329→      c.right = 95;
+   330→   330→      c.top = 95;
+   331→   331→      c.bottom = -95;
+   332→   332→      c.near = 1;
+   333→   333→      c.far = 400;
+   334→   334→      this.sun.shadow.bias = -0.0002;
+   335→   335→      this.sun.shadow.normalBias = 0.04;
+   336→   336→    }
+   337→   337→    this.scene.add(this.sun);
+   338→   338→    this.scene.add(this.sun.target);
+   339→   339→
+   340→   340→    // ── water time uniform + tiles ──
+   341→   341→    this.tiles = new TileManager(this.scene, opts.renderRadius, { time: this.waterTime, tint: this.waterTint });
+   342→   342→
+   343→   343→    // ── the player's car ──
+   344→   344→    this.built = buildCar(car);
+   345→   345→    this.scene.add(this.built.group);
+   346→   346→
+   347→   347→    // gearbox: shift points as widening fractions of the road top speed
+   348→   348→    const pattern = car.id === "sport" ? [0.24, 0.4, 0.55, 0.7, 0.86, 1.02] : [0.3, 0.48, 0.66, 0.84, 1.02];
+   349→   349→    this.gearTop = pattern.map((f) => f * car.stats.topSpeed);
+   350→   350→
+   351→   351→    // headlight beam (auto-on at night) + boosted emissive lamps
+   352→   352→    this.headlights = new THREE.SpotLight(0xffe3ae, 0, 85, 0.62, 0.55, 1);
+   353→   353→    this.headlights.position.set(0, 0.85, 1.5);
+   354→   354→    const beamTarget = new THREE.Object3D();
+   355→   355→    beamTarget.position.set(0, 0.1, 14);
+   356→   356→    this.built.group.add(this.headlights, beamTarget);
+   357→   357→    this.headlights.target = beamTarget;
+   358→   358→    this.headlights.castShadow = false;
+   359→   359→    this.built.group.traverse((o) => {
+   360→   360→      const m = (o as THREE.Mesh).material as THREE.MeshStandardMaterial | undefined;
+   361→   361→      if (m && (m as THREE.MeshStandardMaterial).isMeshStandardMaterial && m.emissiveIntensity > 0) {
+   362→   362→        if (!this.glowMats.some((g) => g[0] === m)) this.glowMats.push([m, m.emissiveIntensity]);
+   363→   363→      }
+   364→   364→    });
+   365→   365→
+   366→   366→    const spawn = findRoadSpawn();
+   367→   367→    this.pos.set(spawn.x, surfaceHeightAt(spawn.x, spawn.z), spawn.z);
+   368→   368→    this.heading = spawn.heading;
+   369→   369→    this.smoothY = this.pos.y;
+   370→   370→    this.tiles.preload(this.pos.x, this.pos.z);
+   371→   371→    // ── input ──
+   372→   372→    this.resizeHandler = () => this.resize();
+   373→   373→    window.addEventListener("resize", this.resizeHandler);
+   374→   374→    this.resize();
+   375→   375→    window.addEventListener("keydown", this.onKeyDown);
+   376→   376→    window.addEventListener("keyup", this.onKeyUp);
+   377→   377→    window.addEventListener("blur", this.onBlur);
+   378→   378→  }
+   379→   379→
+   380→   380→  // ── public API ─────────────────────────────────────────────────────────────
+   381→   381→
+   382→   382→  start() {
+   383→   383→    this.clock.start();
+   384→   384→    this.loop();
+   385→   385→  }
+   386→   386→
+   387→   387→  pause() {
+   388→   388→    this.paused = true;
+   389→   389→  }
+   390→   390→
+   391→   391→  resume() {
+   392→   392→    if (!this.disposed) {
+   393→   393→      this.paused = false;
+   394→   394→      this.clock.getDelta(); // swallow the pause gap
+   395→   395→    }
+   396→   396→  }
+   397→   397→
+   398→   398→  setRenderRadius(r: number) {
+   399→   399→    this.opts.renderRadius = r;
+   400→   400→    this.tiles.setRadius(r);
+   401→   401→    (this.scene.fog as THREE.Fog).near = r * TILE * 0.7;
+   402→   402→    (this.scene.fog as THREE.Fog).far = r * TILE * 1.55 + 120;
+   403→   403→  }
+   404→   404→
+   405→   405→  setShadows(on: boolean) {
+   406→   406→    this.opts.shadows = on;
+   407→   407→    this.renderer.shadowMap.enabled = on;
+   408→   408→    this.sun.castShadow = on;
+   409→   409→    // materials need a nudge to recompile
+   410→   410→    this.scene.traverse((o) => {
+   411→   411→      const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+   412→   412→      if (m) {
+   413→   413→        if (Array.isArray(m)) m.forEach((mm) => mm.needsUpdate = true);
+   414→   414→        else m.needsUpdate = true;
+   415→   415→      }
+   416→   416→    });
+   417→   417→  }
+   418→   418→
+   419→   419→  // ── day-night public API ─────────────────────────────────────────────────────
+   420→   420→
+   421→   421→  /** Enable/disable the automatic day-night cycle; optionally change the day
+   422→   422→   *  length (real seconds per in-world 24h). When disabled, time freezes at
+   423→   423→   *  its current value until lockTimeOfDay() is called. */
+   424→   424→  setCycle(enabled: boolean, dayLengthSeconds?: number) {
+   425→   425→    this.cycleEnabled = enabled;
+   426→   426→    if (dayLengthSeconds !== undefined) this.dayLength = Math.max(30, dayLengthSeconds);
+   427→   427→  }
+   428→   428→
+   429→   429→  /** Freeze the world at a specific hour [0, 24). Disables the cycle. */
+   430→   430→  lockTimeOfDay(hours: number) {
+   431→   431→    this.cycleEnabled = false;
+   432→   432→    this.todHours = ((hours % 24) + 24) % 24;
+   433→   433→  }
+   434→   434→
+   435→   435→  /** Current time of day in hours [0, 24). */
+   436→   436→  get timeOfDay(): number {
+   437→   437→    return this.todHours;
+   438→   438→  }
+   439→   439→
+   440→   440→  /**
+   441→   441→   * Push the current time of day into every visual system: sky gradient, sun
+   442→   442→   * and moon discs, stars, fog, hemisphere + directional lights, water tint,
+   443→   443→   * tone-mapping exposure and the car's automatic headlights.
+   444→   444→   */
+   445→   445→  private applyEnvironment() {
+   446→   446→    const e = sampleEnv(this.todHours, _env);
+   447→   447→
+   448→   448→    // sun/moon arc: 6:00 sunrise in the east, 12:00 high noon, 18:00 sunset west
+   449→   449→    const a = ((this.todHours - 6) / 24) * Math.PI * 2;
+   450→   450→    this._sunDir.set(Math.cos(a), Math.sin(a), 0.38).normalize();
+   451→   451→
+   452→   452→    (this.skyU.top.value as THREE.Color).copy(e.top);
+   453→   453→    (this.skyU.horizon.value as THREE.Color).copy(e.hor);
+   454→   454→    (this.skyU.bottom.value as THREE.Color).copy(e.bot);
+   455→   455→    (this.skyU.sunColor.value as THREE.Color).copy(e.sunC);
+   456→   456→    (this.skyU.sunDir.value as THREE.Vector3).copy(this._sunDir);
+   457→   457→    (this.skyU.night as THREE.IUniform).value = e.night;
+   458→   458→
+   459→   459→    (this.scene.fog as THREE.Fog).color.copy(e.fog);
+   460→   460→    this.hemi.color.copy(e.hemiS);
+   461→   461→    this.hemi.groundColor.copy(e.hemiG);
+   462→   462→    this.hemi.intensity = e.hemiI;
+   463→   463→    this.sun.color.copy(e.sunC);
+   464→   464→    this.sun.intensity = e.sunI;
+   465→   465→    this.renderer.toneMappingExposure = e.exp;
+   466→   466→    this.waterTint.value.copy(e.water);
+   467→   467→
+   468→   468→    // automatic headlights — fade in through twilight, boost the lamp glow
+   469→   469→    const hl = clamp(e.night * 1.25, 0, 1);
+   470→   470→    this.headlights.intensity = 30 * hl;
+   471→   471→    for (const [m, base] of this.glowMats) m.emissiveIntensity = base * (1 + 1.9 * hl);
+   472→   472→  }
+   473→   473→
+   474→   474→  dispose() {
+   475→   475→    this.disposed = true;
+   476→   476→    cancelAnimationFrame(this.raf);
+   477→   477→    window.removeEventListener("resize", this.resizeHandler);
+   478→   478→    window.removeEventListener("keydown", this.onKeyDown);
+   479→   479→    window.removeEventListener("keyup", this.onKeyUp);
+   480→   480→    window.removeEventListener("blur", this.onBlur);
+   481→   481→    this.built.group.traverse((o) => {
+   482→   482→      const mesh = o as THREE.Mesh;
+   483→   483→      if (mesh.geometry) mesh.geometry.dispose();
+   484→   484→    });
+   485→   485→    this.built.group.traverse((o) => {
+   486→   486→      const m = (o as THREE.Mesh).material as THREE.Material | undefined;
+   487→   487→      if (m) m.dispose();
+   488→   488→    });
+   489→   489→    this.tiles.disposeAll();
+   490→   490→    this.sky.geometry.dispose();
+   491→   491→    (this.sky.material as THREE.Material).dispose();
+   492→   492→    this.renderer.dispose();
+   493→   493→  }
+   494→   494→
+   495→   495→  // ── input handlers ──────────────────────────────────────────────────────────
+   496→   496→
+   497→   497→  /** Normalize key events: prefer e.code, fall back to e.key (some environments
+   498→   498→   *  omit `code`, e.g. automated browsers / some IMEs). */
+   499→   499→  private keyFor(e: KeyboardEvent): string {
+   500→   500→    if (e.code) return e.code;
+   501→   501→    switch (e.key) {
+   502→   502→      case "ArrowUp":
+   503→   503→      case "ArrowDown":
+   504→   504→      case "ArrowLeft":
+   505→   505→      case "ArrowRight":
+   506→   506→        return e.key;
+   507→   507→      case " ":
+   508→   508→        return "Space";
+   509→   509→      default:
+   510→   510→        if (e.key.length === 1) return `Key${e.key.toUpperCase()}`;
+   511→   511→        return `Key${e.key}`;
+   512→   512→    }
+   513→   513→  }
+   514→   514→
+   515→   515→  private onKeyDown = (e: KeyboardEvent) => {
+   516→   516→    const code = this.keyFor(e);
+   517→   517→    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"].includes(code)) {
+   518→   518→      e.preventDefault();
+   519→   519→    }
+   520→   520→    if (e.repeat) return;
+   521→   521→    this.keys.add(code);
+   522→   522→    if (code === "KeyC") this.cameraMode = 1 - this.cameraMode;
+   523→   523→    if (code === "KeyR") this.respawn();
+   524→   524→  };
+   525→   525→  private onKeyUp = (e: KeyboardEvent) => {
+   526→   526→    this.keys.delete(this.keyFor(e));
+   527→   527→  };
+   528→   528→  private onBlur = () => {
+   529→   529→    this.keys.clear();
+   530→   530→  };
+   531→   531→
+   532→   532→  // ── helpers ────────────────────────────────────────────────────────────────
+   533→   533→
+   534→   534→  private resize() {
+   535→   535→    const w = this.canvas.clientWidth || window.innerWidth;
+   536→   536→    const h = this.canvas.clientHeight || window.innerHeight;
+   537→   537→    this.renderer.setSize(w, h, false);
+   538→   538→    this.camera.aspect = w / h;
+   539→   539→    this.camera.updateProjectionMatrix();
+   540→   540→  }
+   541→   541→
+   542→   542→  private respawn() {
+   543→   543→    const spawn = findRoadSpawnNearest(this.pos.x, this.pos.z);
+   544→   544→    this.pos.set(spawn.x, surfaceHeightAt(spawn.x, spawn.z), spawn.z);
+   545→   545→    this.heading = spawn.heading;
+   546→   546→    this.speed = 0;
+   547→   547→    this.smoothY = this.pos.y;
+   548→   548→  }
+   549→   549→
+   550→   550→  // ── physics ────────────────────────────────────────────────────────────────
+   551→   551→
+   552→   552→  private updatePhysics(dt: number) {
+   553→   553→    const s = this.car.stats;
+   554→   554→    const k = this.keys;
+   555→   555→
+   556→   556→    // inputs
+   557→   557→    const throttle = k.has("KeyW") || k.has("ArrowUp") ? 1 : 0;
+   558→   558→    const brake = k.has("KeyS") || k.has("ArrowDown") ? 1 : 0;
+   559→   559→    const steerIn = (k.has("KeyA") || k.has("ArrowLeft") ? 1 : 0) - (k.has("KeyD") || k.has("ArrowRight") ? 1 : 0);
+   560→   560→    const handbrake = k.has("Space");
+   561→   561→
+   562→   562→    // surface conditions
+   563→   563→    const h = surfaceHeightAt(this.pos.x, this.pos.z);
+   564→   564→    const onRoad = isOnRoad(this.pos.x, this.pos.z);
+   565→   565→    const inWater = h < 0.35; // shallow water / river fords
+   566→   566→
+   567→   567→    let surfaceFactor = onRoad ? 1 : s.offroad;
+   568→   568→    if (inWater) surfaceFactor *= 0.25;
+   569→   569→    // heavy viscous drag in water — rivers can be forded slowly, lakes will bog you down
+   570→   570→    if (inWater) this.speed -= this.speed * 2.4 * dt;
+   571→   571→
+   572→   572→    // ── gearbox: auto shift up through the speed ranges, back down on lift ──
+   573→   573→    const roadTop = s.topSpeed;
+   574→   574→    const hi = this.gearTop[this.gear - 1];
+   575→   575→    const lo = this.gear > 1 ? this.gearTop[this.gear - 2] * 0.92 : 0;
+   576→   576→    if (this.speed > hi && this.gear < this.gearTop.length) this.gear++;
+   577→   577→    else if (this.speed < lo && this.gear > 1) this.gear--;
+   578→   578→
+   579→   579→    // revs within the current gear, with a little launch flare and a
+   580→   580→    // scaled "reverse gear" band when backing up
+   581→   581→    let revNorm = clamp((this.speed - lo) / Math.max(hi - lo, 1), 0, 1);
+   582→   582→    if (throttle && this.speed < 1.5) revNorm = Math.max(revNorm, 0.5);
+   583→   583→    if (this.speed < -0.3) revNorm = clamp(Math.abs(this.speed) / (roadTop * 0.25), 0, 1) * 0.85;
+   584→   584→    this.revs = lerp(this.revs, revNorm, 1 - Math.exp(-8 * dt));
+   585→   585→
+   586→   586→    // longitudinal
+   587→   587→    const topSpeed = roadTop * (onRoad ? 1 : lerp(s.offroad, 1, 0.25));
+   588→   588→    if (throttle) {
+   589→   589→      const powerCurve = 1 - Math.max(this.speed, 0) / (topSpeed * 1.35);
+   590→   590→      const torque = lerp(0.62, 1, revNorm); // short gears pull harder
+   591→   591→      this.speed += s.accel * Math.max(powerCurve, 0) * torque * surfaceFactor * dt;
+   592→   592→    }
+   593→   593→    if (brake && this.speed > 0.5) {
+   594→   594→      // heavy braking — the fronts can lock and the car skids. At speed the
+   595→   595→      // pedal overpowers the tires almost immediately (real stomp = lock);
+   596→   596→      // parking-speed stops stay controlled because lock builds slowly there.
+   597→   597→      const lockGain = (this.speed > 9 ? 3.4 : 0.9) * (onRoad ? 1 : 1.5);
+   598→   598→      this.lockProg = clamp(this.lockProg + lockGain * dt, 0, 1);
+   599→   599→      this.speed -= (this.lockProg >= 1 ? 13.5 : 26) * dt;
+   600→   600→    } else if (brake) {
+   601→   601→      this.speed -= s.accel * 0.45 * surfaceFactor * dt; // reverse
+   602→   602→    } else {
+   603→   603→      this.lockProg = Math.max(0, this.lockProg - 3 * dt);
+   604→   604→    }
+   605→   605→    this.locked = this.lockProg >= 1 && this.speed > 4;
+   606→   606→    if (handbrake) this.speed -= Math.sign(this.speed) * 14 * dt;
+   607→   607→
+   608→   608→    // drag & rolling resistance
+   609→   609→    const drag = onRoad ? 0.06 : 0.16;
+   610→   610→    this.speed -= this.speed * drag * dt;
+   611→   611→    this.speed -= Math.sign(this.speed) * (onRoad ? 0.8 : 2.2) * dt;
+   612→   612→    if (Math.abs(this.speed) < 0.02 && !throttle && !brake) this.speed = 0;
+   613→   613→    this.speed = clamp(this.speed, -topSpeed * 0.25, topSpeed);
+   614→   614→
+   615→   615→    // slope gravity: steeper climbs bleed speed, descents add it
+   616→   616→    const dirX = Math.sin(this.heading);
+   617→   617→    const dirZ = Math.cos(this.heading);
+   618→   618→    const ahead = surfaceHeightAt(this.pos.x + dirX * 2, this.pos.z + dirZ * 2);
+   619→   619→    const behind = surfaceHeightAt(this.pos.x - dirX * 2, this.pos.z - dirZ * 2);
+   620→   620→    const slope = (ahead - behind) / 4;
+   621→   621→    this.speed -= slope * 16 * dt;
+   622→   622→    // steep faces act like walls: extra braking beyond ~50% grade so the car
+   623→   623→    // can't claw its way up cliffs (this is what prevented sinking/porpoising)
+   624→   624→    if (slope > 0.5 && this.speed > 0) this.speed -= (slope - 0.5) * 120 * dt;
+   625→   625→    if (slope < -0.5 && this.speed < 0) this.speed -= (slope + 0.5) * 120 * dt;
+   626→   626→
+   627→   627→    // steering — the yaw the tires can actually deliver is capped by grip,
+   628→   628→    // so inertia limits how fast the car changes direction at speed
+   629→   629→    const speedRatio = clamp(Math.abs(this.speed) / 10, 0, 1);
+   630→   630→    const steerRate = 1.9 * s.grip * (handbrake ? 1.7 : 1);
+   631→   631→    const desired = steerIn * steerRate * speedRatio * (this.speed < 0 ? -1 : 1);
+   632→   632→    const latMax = 12.5 * s.grip * (this.locked ? 0.34 : 1) * (handbrake ? 1.55 : 1);
+   633→   633→    const yawMax = latMax / Math.max(Math.abs(this.speed), 2.5);
+   634→   634→    this.heading += clamp(desired, -yawMax, yawMax) * dt;
+   635→   635→    // locked wheels keep their momentum — the nose keeps drifting with committed
+   636→   636→    // steering input, so you counter-steer through the slide
+   637→   637→    if (this.locked) this.heading += this.steerAngle * 0.4 * clamp(this.speed / 30, 0, 1) * dt;
+   638→   638→    this.steerAngle = lerp(this.steerAngle, steerIn * 0.42, 1 - Math.exp(-10 * dt));
+   639→   639→
+   640→   640→    // torque steer: a hard launch tugs the nose to one side until speed builds
+   641→   641→    if (throttle && this.speed > -0.1) {
+   642→   642→      const decay = 1 - clamp(this.speed / 9, 0, 1);
+   643→   643→      this.heading -= (0.05 + s.accel * 0.004) * decay * decay * dt;
+   644→   644→    }
+   645→   645→
+   646→   646→    // integrate position
+   647→   647→    this.pos.x += dirX * this.speed * dt;
+   648→   648→    this.pos.z += dirZ * this.speed * dt;
+   649→   649→    this.odometer += Math.abs(this.speed) * dt;
+   650→   650→    this.throttleIn = !!throttle;
+   651→   651→
+   652→   652→    // fell into deep water? respawn (river beds carve to ~-1.9, so anything
+   653→   653→    // below -1.35 is undriveable — never leave the car floating there)
+   654→   654→    const newH = surfaceHeightAt(this.pos.x, this.pos.z);
+   655→   655→    if (newH < -1.35) {
+   656→   656→      this.respawn();
+   657→   657→      return;
+   658→   658→    }
+   659→   659→
+   660→   660→    // bogged down in shallow water (heavy drag, no traction)? after a few
+   661→   661→    // seconds of barely moving, rescue the player back onto the road
+   662→   662→    if (inWater && Math.abs(this.speed) < 0.6) {
+   663→   663→      this.stuckTimer += dt;
+   664→   664→      if (this.stuckTimer > 3) {
+   665→   665→        this.stuckTimer = 0;
+   666→   666→        this.respawn();
+   667→   667→        return;
+   668→   668→      }
+   669→   669→    } else {
+   670→   670→      this.stuckTimer = 0;
+   671→   671→    }
+   672→   672→
+   673→   673→    // ground follow with soft suspension — anti-sink:
+   674→   674→    //  · body height = average of the four wheel contact points (physical)
+   675→   675→    //  · if the terrain pokes up under the chassis centre (crest), lift to clear
+   676→   676→    //  · rise quickly (no lagging into uphills), settle down gently (airtime)
+   677→   677→    const hFL = surfaceHeightAt(this.pos.x - dirZ * 1.1 + dirX * 1.4, this.pos.z + dirX * 1.1 + dirZ * 1.4);
+   678→   678→    const hFR = surfaceHeightAt(this.pos.x + dirZ * 1.1 + dirX * 1.4, this.pos.z - dirX * 1.1 + dirZ * 1.4);
+   679→   679→    const hRL = surfaceHeightAt(this.pos.x - dirZ * 1.1 - dirX * 1.4, this.pos.z + dirX * 1.1 - dirZ * 1.4);
+   680→   680→    const hRR = surfaceHeightAt(this.pos.x + dirZ * 1.1 - dirX * 1.4, this.pos.z - dirX * 1.1 - dirZ * 1.4);
+   681→   681→    const hC = surfaceHeightAt(this.pos.x, this.pos.z);
+   682→   682→    const avg = (hFL + hFR + hRL + hRR) / 4;
+   683→   683→    const groundH = Math.max(avg, hC - 0.15);
+   684→   684→    const targetY = Math.max(groundH, -0.15);
+   685→   685→    const rate = targetY >= this.smoothY ? 30 : 13;
+   686→   686→    this.smoothY = lerp(this.smoothY, targetY, 1 - Math.exp(-rate * dt));
+   687→   687→    // hard floor: the rendered surface IS the physics surface (surfaceHeightAt
+   688→   688→    // interpolates the exact mesh triangles), so with a tight tolerance the
+   689→   689→    // wheels can visibly touch the ground everywhere — no sink, no hover
+   690→   690→    this.pos.y = Math.max(this.smoothY, Math.max(hFL, hFR, hRL, hRR, hC) - 0.1);
+   691→   691→
+   692→   692→    // body attitude from terrain (reuse the wheel samples — cheap and smooth)
+   693→   693→    const forwardPitch = Math.atan2((hFL + hFR) / 2 - (hRL + hRR) / 2, 2.8);
+   694→   694→    const sideRoll = Math.atan2((hFL + hRL) / 2 - (hFR + hRR) / 2, 2.2);
+   695→   695→    this.pitch = lerp(this.pitch, forwardPitch, 1 - Math.exp(-8 * dt));
+   696→   696→    this.roll = lerp(this.roll, sideRoll + this.steerAngle * clamp(this.speed / 40, 0, 1) * 0.18, 1 - Math.exp(-8 * dt));
+   697→   697→
+   698→   698→    // apply to car mesh
+   699→   699→    this.built.group.position.copy(this.pos);
+   700→   700→    this.built.group.rotation.set(0, 0, 0);
+   701→   701→    this.built.group.rotateY(this.heading);
+   702→   702→    this.built.group.rotateX(-this.pitch); // nose up on climb
+   703→   703→    this.built.group.rotateZ(-this.roll);
+   704→   704→
+   705→   705→    // wheels: steer + spin
+   706→   706→    this.wheelSpin += (this.speed / this.car.wheelR) * dt;
+   707→   707→    this.built.steerWheels.forEach((w) => {
+   708→   708→      w.rotation.y = this.steerAngle;
+   709→   709→    });
+   710→   710→    this.built.wheels.forEach((w) => {
+   711→   711→      w.rotation.x = -this.wheelSpin;
+   712→   712→    });
+   713→   713→  }
+   714→   714→
+   715→   715→  // ── camera ─────────────────────────────────────────────────────────────────
+   716→   716→
+   717→   717→  private updateCamera(dt: number) {
+   718→   718→    const dirX = Math.sin(this.heading);
+   719→   719→    const dirZ = Math.cos(this.heading);
+   720→   720→    const sp = Math.abs(this.speed);
+   721→   721→    const far = this.cameraMode === 1;
+   722→   722→    const dist = (far ? 16 : 8.2) + sp * (far ? 0.16 : 0.09);
+   723→   723→    const height = far ? 9.5 : 3.1 + sp * 0.012;
+   724→   724→
+   725→   725→    // reversing? the camera swings around to the front and looks down the
+   726→   726→    // car's path of travel, so you can see where you're backing into
+   727→   727→    this.revBlend = lerp(this.revBlend, this.speed < -0.6 ? 1 : 0, 1 - Math.exp(-3.2 * dt));
+   728→   728→    const side = dist * (2 * this.revBlend - 1); // -dist behind .. +dist ahead
+   729→   729→    const camX = this.pos.x + dirX * side;
+   730→   730→    const camZ = this.pos.z + dirZ * side;
+   731→   731→    const groundClear = surfaceHeightAt(camX, camZ) + 1.6;
+   732→   732→    const camY = Math.max(this.pos.y + height, groundClear);
+   733→   733→
+   734→   734→    _camPos.set(camX, camY, camZ);
+   735→   735→    this.camera.position.lerp(_camPos, 1 - Math.exp(-(far ? 3 : 6) * dt));
+   736→   736→
+   737→   737→    const lookSide = 7 * (1 - 2 * this.revBlend); // ahead .. behind
+   738→   738→    _look.set(this.pos.x + dirX * lookSide, this.pos.y + 1.6, this.pos.z + dirZ * lookSide);
+   739→   739→    this.camera.lookAt(_look);
+   740→   740→
+   741→   741→    const fov = 56 + clamp(sp / 60, 0, 1) * 10;
+   742→   742→    if (Math.abs(this.camera.fov - fov) > 0.05) {
+   743→   743→      this.camera.fov = lerp(this.camera.fov, fov, 1 - Math.exp(-4 * dt));
+   744→   744→      this.camera.updateProjectionMatrix();
+   745→   745→    }
+   746→   746→
+   747→   747→    // keep the sky dome centred on the camera
+   748→   748→    this.sky.position.copy(this.camera.position);
+   749→   749→  }
+   750→   750→
+   751→   751→  // ── main loop ──────────────────────────────────────────────────────────────
+   752→   752→
+   753→   753→  private loop = () => {
+   754→   754→    if (this.disposed) return;
+   755→   755→    this.raf = requestAnimationFrame(this.loop);
+   756→   756→    const dt = Math.min(this.clock.getDelta(), 0.05);
+   757→   757→    if (this.paused) return;
+   758→   758→
+   759→   759→    this.waterTime.value += dt;
+   760→   760→    if (this.cycleEnabled) {
+   761→   761→      this.todHours = (this.todHours + (24 / this.dayLength) * dt) % 24;
+   762→   762→    }
+   763→   763→    this.applyEnvironment();
+   764→   764→    this.updatePhysics(dt);
+   765→   765→    this.tiles.update(this.pos.x, this.pos.z);
+   766→   766→
+   767→   767→    // shadow frustum follows the car (snapped to reduce shimmer); the light
+   768→   768→    // itself comes from the sun by day and the moon by night
+   769→   769→    const sx = Math.round(this.pos.x / 2) * 2;
+   770→   770→    const sz = Math.round(this.pos.z / 2) * 2;
+   771→   771→    _lightDir.copy(this._sunDir);
+   772→   772→    if (_lightDir.y <= 0) _lightDir.multiplyScalar(-1); // moonlight
+   773→   773→    _lightDir.y = Math.max(Math.abs(_lightDir.y), 0.3); // keep shadows well-conditioned
+   774→   774→    _lightDir.normalize();
+   775→   775→    this.sun.position.set(sx + _lightDir.x * 150, _lightDir.y * 150, sz + _lightDir.z * 150);
+   776→   776→    this.sun.target.position.set(sx, 0, sz);
+   777→   777→
+   778→   778→    this.updateCamera(dt);
+   779→   779→    this.renderer.render(this.scene, this.camera);
+   780→   780→
+   781→   781→    // HUD ~16x per second (keeps the rev bar lively)
+   782→   782→    this.hudTimer += dt;
+   783→   783→    if (this.hudTimer > 0.06 && this.onHud) {
+   784→   784→      this.hudTimer = 0;
+   785→   785→      const h = surfaceHeightAt(this.pos.x, this.pos.z);
+   786→   786→      const tt = h < 0.35 && !isOnRoad(this.pos.x, this.pos.z) ? "ocean" : terrainTypeAt(this.pos.x, this.pos.z, Math.max(h, 0));
+   787→   787→      if (typeof window !== "undefined" && (window as unknown as Record<string, unknown>).__dlDebug) {
+   788→   788→        console.log(
+   789→   789→          `[dl] x=${this.pos.x.toFixed(1)} z=${this.pos.z.toFixed(1)} carY=${this.pos.y.toFixed(2)} terrain=${h.toFixed(2)} agl=${(this.pos.y - h).toFixed(2)}`
+   790→   790→        );
+   791→   791→      }
+   792→   792→      const hh = Math.floor(this.todHours);
+   793→   793→      const mm = Math.floor((this.todHours - hh) * 60);
+   794→   794→      const clock = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+   795→   795→      this.onHud({
+   796→   796→        kmh: Math.round(Math.abs(this.speed) * 3.6),
+   797→   797→        biome: BIOME_LABEL[tt] ?? tt,
+   798→   798→        x: this.pos.x,
+   799→   799→        z: this.pos.z,
+   800→   800→        tilesLoaded: this.tiles.loadedCount,
+   801→   801→        heading: this.heading,
+   802→   802→        onRoad: isOnRoad(this.pos.x, this.pos.z),
+   803→   803→        clock,
+   804→   804→        tod: this.todHours,
+   805→   805→        gear: this.speed < -0.3 ? -1 : Math.abs(this.speed) < 0.3 && !this.throttleIn ? 0 : this.gear,
+   806→   806→        revs: this.revs,
+   807→   807→        distance: this.odometer,
+   808→   808→        locked: this.locked,
+   809→   809→      });
+   810→   810→    }
+   811→   811→  };
+   812→   812→}
+   813→   813→
+   814→   814→// scratch vectors
+   815→   815→const _camPos = new THREE.Vector3();
+   816→   816→const _look = new THREE.Vector3();
+   817→   817→const _lightDir = new THREE.Vector3();
+   818→   818→
+   819→   819→/** Spawn on the road lattice closest to a given position (for the R-key reset). */
+   820→   820→function findRoadSpawnNearest(px: number, pz: number): { x: number; z: number; heading: number } {
+   821→   821→  const fallback = findRoadSpawn();
+   822→   822→  let best = fallback;
+   823→   823→  let bestD = Infinity;
+   824→   824→  // coarse scan around the player, then refine
+   825→   825→  for (let z = pz - 480; z <= pz + 480; z += 48) {
+   826→   826→    let bx = px;
+   827→   827→    let bd = Infinity;
+   828→   828→    for (let dx = -300; dx <= 300; dx += 6) {
+   829→   829→      const d = roadDistance(px + dx, z);
+   830→   830→      if (d < bd) {
+   831→   831→        bd = d;
+   832→   832→        bx = px + dx;
+   833→   833→      }
+   834→   834→    }
+   835→   835→    if (bd > 6 || surfaceHeightAt(bx, z) < 1.2) continue;
+   836→   836→    const x2 = bestNextX(bx, z + 1);
+   837→   837→    const cand = { x: bx, z, heading: Math.atan2(x2 - bx, 1) };
+   838→   838→    const d = (bx - px) ** 2 + (z - pz) ** 2;
+   839→   839→    if (d < bestD) {
+   840→   840→      bestD = d;
+   841→   841→      best = cand;
+   842→   842→    }
+   843→   843→  }
+   844→   844→  return bestD < Infinity ? best : fallback;
+   845→   845→}
+   846→   846→
+   847→   847→function bestNextX(bx: number, z: number): number {
+   848→   848→  let best = bx;
+   849→   849→  let bd = Infinity;
+   850→   850→  for (let dx = -4; dx <= 4; dx += 2) {
+   851→   851→    const d = roadDistance(bx + dx, z);
+   852→   852→    if (d < bd) {
+   853→   853→      bd = d;
+   854→   854→      best = bx + dx;
+   855→   855→    }
+   856→   856→  }
+   857→   857→  return best;
+   858→   858→}
+   859→   859→
